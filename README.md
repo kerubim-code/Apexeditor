@@ -2,6 +2,7 @@
 
 all local apex cfg / settings / Optimization
 
+```
 apex video cfg
 Downloads and installs video config files (kerubimm), shows where they are placed, and launches the game.
 Custom
