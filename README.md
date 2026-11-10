@@ -19,7 +19,7 @@ A fixed crosshair at the center of the screen.
 Overlay
 Images and GIFs placed on top of everything.
 
-## Structure du projet
+## project
 
 ```
 client\                 
