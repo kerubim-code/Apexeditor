@@ -1,0 +1,10 @@
+#include <windows.h>
+
+#include "client\appres.h"
+
+IDI_APEX ICON "resource\\apex.ico"
+
+IDR_FA_SOLID  RCDATA "liquidDX11-main\\data\\fa\\fa-solid-900.ttf"
+IDR_FA_BRANDS RCDATA "liquidDX11-main\\data\\fa\\fa-brands-400.ttf"
+
+IDR_LOGO      RCDATA "resource\\logo.jpg"
