@@ -18,12 +18,16 @@
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -747,17 +751,524 @@ std::string NarrowPath(const std::wstring& path) {
     return out;
 }
 
-bool ChooseJsonPath(HWND owner, bool save, std::wstring& path) {
-    wchar_t file[MAX_PATH] = L"apex-settings.json";
+std::wstring WidenPath(const std::string& path) {
+    if (path.empty())
+        return {};
+    const int needed =
+        MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+    if (needed <= 1)
+        return {};
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, out.data(), needed);
+    out.resize(static_cast<size_t>(needed - 1));
+    return out;
+}
+
+std::wstring WidenUtf8(const std::string& text) {
+    if (text.empty())
+        return {};
+    const int needed =
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (needed <= 1)
+        return {};
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), needed);
+    out.resize(static_cast<size_t>(needed - 1));
+    return out;
+}
+
+bool FileExistsW(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+void EnsureDirectoryW(const std::wstring& dir) {
+    std::wstring built;
+    built.reserve(dir.size());
+    for (wchar_t c : dir) {
+        built += c;
+        if ((c == L'\\' || c == L'/') && built.size() > 3)
+            CreateDirectoryW(built.c_str(), nullptr);
+    }
+    CreateDirectoryW(dir.c_str(), nullptr);
+}
+
+bool WriteBinaryFileW(const std::wstring& path, const char* data, size_t size) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out.write(data, static_cast<std::streamsize>(size));
+    return out.good();
+}
+
+std::wstring ParentDirW(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+bool RemoveTreeW(const std::wstring& path) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+        return true;
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        return DeleteFileW(path.c_str()) != FALSE;
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        return RemoveDirectoryW(path.c_str()) != FALSE;
+    }
+
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((path + L"\\*").c_str(), &find);
+    if (handle != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = find.cFileName;
+            if (name == L"." || name == L"..")
+                continue;
+            const std::wstring child = path + L"\\" + name;
+            if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveTreeW(child);
+            } else {
+                SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(child.c_str());
+            }
+        } while (FindNextFileW(handle, &find));
+        FindClose(handle);
+    }
+
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    return RemoveDirectoryW(path.c_str()) != FALSE;
+}
+
+bool MoveTreeWithRetry(const std::wstring& from, const std::wstring& to) {
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (MoveFileW(from.c_str(), to.c_str()))
+            return true;
+        Sleep(150);
+    }
+    return false;
+}
+
+bool CopyTreeW(const std::wstring& src, const std::wstring& dst,
+               std::string& error) {
+    const DWORD attrs = GetFileAttributesW(src.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        error = NarrowPath(src);
+        return false;
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+        return true;
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        EnsureDirectoryW(ParentDirW(dst));
+        bool copied = false;
+        for (int attempt = 0; attempt < 4 && !copied; ++attempt) {
+            copied = CopyFileW(src.c_str(), dst.c_str(), FALSE) != FALSE;
+            if (!copied)
+                Sleep(100);
+        }
+        if (!copied) {
+            error = NarrowPath(src);
+            return false;
+        }
+        return true;
+    }
+
+    EnsureDirectoryW(dst);
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((src + L"\\*").c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE)
+        return true;
+
+    bool ok = true;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..")
+            continue;
+        if (!CopyTreeW(src + L"\\" + name, dst + L"\\" + name, error)) {
+            ok = false;
+            break;
+        }
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+    return ok;
+}
+
+std::wstring LowerPath(std::wstring text) {
+    for (wchar_t& c : text)
+        c = static_cast<wchar_t>(std::towlower(c));
+    return text;
+}
+
+void PruneEmptyDirsW(const std::wstring& dir) {
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((dir + L"\\*").c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE)
+        return;
+
+    std::vector<std::wstring> subdirs;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..")
+            continue;
+        if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            subdirs.push_back(dir + L"\\" + name);
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+
+    for (const std::wstring& sub : subdirs) {
+        PruneEmptyDirsW(sub);
+        RemoveDirectoryW(sub.c_str());
+    }
+}
+
+bool PathExistsW(const std::wstring& path) {
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool SamePathW(const std::wstring& a, const std::wstring& b) {
+    std::wstring left  = LowerPath(a);
+    std::wstring right = LowerPath(b);
+    while (!left.empty() && (left.back() == L'\\' || left.back() == L'/'))
+        left.pop_back();
+    while (!right.empty() && (right.back() == L'\\' || right.back() == L'/'))
+        right.pop_back();
+    return left == right;
+}
+
+bool IsInsideW(const std::wstring& path, const std::wstring& parent) {
+    std::wstring p = LowerPath(parent);
+    std::wstring c = LowerPath(path);
+    while (!p.empty() && (p.back() == L'\\' || p.back() == L'/'))
+        p.pop_back();
+    if (p.empty() || c.size() <= p.size() || c.compare(0, p.size(), p) != 0)
+        return false;
+    return c[p.size()] == L'\\' || c[p.size()] == L'/';
+}
+
+std::wstring BaseNameW(const std::wstring& path) {
+    std::wstring trimmed = path;
+    while (!trimmed.empty() && (trimmed.back() == L'\\' || trimmed.back() == L'/'))
+        trimmed.pop_back();
+    const size_t slash = trimmed.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? trimmed : trimmed.substr(slash + 1);
+}
+
+std::wstring DesktopDirW() {
+    wchar_t profile[MAX_PATH] = {};
+    const DWORD len = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        const std::wstring desktop = std::wstring(profile) + L"\\Desktop";
+        if (PathExistsW(desktop))
+            return desktop;
+    }
+    return {};
+}
+
+bool ListTreeFilesW(const std::wstring& dir, const std::wstring& rel,
+                    std::vector<std::wstring>& files, std::string& error) {
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((dir + L"\\*").c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) {
+        error = NarrowPath(dir);
+        return false;
+    }
+
+    bool ok = true;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..")
+            continue;
+
+        const std::wstring childRel =
+            rel.empty() ? name : rel + L"\\" + name;
+        const std::wstring childPath = dir + L"\\" + name;
+
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                continue;
+            if (!ListTreeFilesW(childPath, childRel, files, error)) {
+                ok = false;
+                break;
+            }
+        } else if (!(find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            files.push_back(childRel);
+        }
+    } while (FindNextFileW(handle, &find));
+
+    FindClose(handle);
+    return ok;
+}
+
+bool PickFolder(HWND owner, const wchar_t* title,
+                const std::wstring& defaultPath, std::wstring& path) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
+        return false;
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options)))
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                           FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+    dialog->SetTitle(title);
+
+    if (!defaultPath.empty()) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(
+                defaultPath.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+            dialog->SetFolder(item);
+            item->Release();
+        }
+    }
+
+    bool ok = false;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* result = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&result))) {
+            PWSTR raw = nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &raw)) &&
+                raw != nullptr) {
+                path = raw;
+                CoTaskMemFree(raw);
+                ok = true;
+            }
+            result->Release();
+        }
+    }
+
+    dialog->Release();
+    return ok;
+}
+
+bool ReplaceApexRoot(const std::wstring& root, const std::wstring& staging,
+                     bool& targetExisted, std::string& error) {
+    const std::wstring backup = root + L".backup";
+    targetExisted = PathExistsW(root);
+    error.clear();
+
+    bool renamedAway = false;
+    bool inPlace     = false;
+    if (targetExisted) {
+        RemoveTreeW(backup);
+        renamedAway = MoveTreeWithRetry(root, backup);
+        if (!renamedAway)
+            inPlace = true;
+    }
+
+    if (inPlace) {
+        // Another process can hold the folder itself open, blocking a rename.
+        // Back up by copy, then replace the contents in place.
+        RemoveTreeW(backup);
+        if (!CopyTreeW(root, backup, error)) {
+            RemoveTreeW(backup);
+            return false;
+        }
+
+        if (!CopyTreeW(staging, root, error))
+            return false;
+
+        std::vector<std::wstring> staged;
+        std::string listError;
+        if (!ListTreeFilesW(staging, L"", staged, listError)) {
+            error = listError;
+            return false;
+        }
+
+        std::vector<std::wstring> keep;
+        keep.reserve(staged.size());
+        for (const std::wstring& rel : staged)
+            keep.push_back(LowerPath(rel));
+        std::sort(keep.begin(), keep.end());
+
+        int staleFailures = 0;
+        std::vector<std::wstring> existing;
+        if (ListTreeFilesW(root, L"", existing, listError)) {
+            for (const std::wstring& rel : existing) {
+                if (std::binary_search(keep.begin(), keep.end(),
+                                       LowerPath(rel)))
+                    continue;
+                const std::wstring full = root + L"\\" + rel;
+                SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                bool deleted = false;
+                for (int attempt = 0; attempt < 4 && !deleted; ++attempt) {
+                    deleted = DeleteFileW(full.c_str()) != FALSE;
+                    if (!deleted)
+                        Sleep(100);
+                }
+                if (!deleted)
+                    ++staleFailures;
+            }
+        }
+        PruneEmptyDirsW(root);
+        RemoveTreeW(staging);
+
+        if (staleFailures != 0) {
+            error = "some old files could not be removed";
+            return false;
+        }
+        return true;
+    }
+
+    if (!MoveTreeWithRetry(staging, root)) {
+        if (renamedAway && !MoveTreeWithRetry(backup, root))
+            error = "could not restore " + NarrowPath(backup);
+        return false;
+    }
+    return true;
+}
+
+void PutU32(std::string& out, uint32_t value) {
+    out.append(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+void PutU64(std::string& out, uint64_t value) {
+    out.append(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+bool TakeU32(const std::string& data, size_t& pos, uint32_t& value) {
+    if (pos > data.size() || data.size() - pos < sizeof(value))
+        return false;
+    memcpy(&value, data.data() + pos, sizeof(value));
+    pos += sizeof(value);
+    return true;
+}
+
+bool TakeU64(const std::string& data, size_t& pos, uint64_t& value) {
+    if (pos > data.size() || data.size() - pos < sizeof(value))
+        return false;
+    memcpy(&value, data.data() + pos, sizeof(value));
+    pos += sizeof(value);
+    return true;
+}
+
+struct ArchiveEntry {
+    std::wstring path;
+    std::wstring rel;
+    uint64_t     size = 0;
+};
+
+bool CollectApexFiles(const std::wstring& dir, const std::wstring& rel,
+                      std::vector<ArchiveEntry>& files, std::string& error) {
+    WIN32_FIND_DATAW find{};
+    const std::wstring pattern = dir + L"\\*";
+    HANDLE handle = FindFirstFileW(pattern.c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) {
+        error = NarrowPath(dir);
+        return false;
+    }
+
+    bool ok = true;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..")
+            continue;
+
+        const DWORD          attrs = find.dwFileAttributes;
+        const std::wstring   childRel =
+            rel.empty() ? name : rel + L"\\" + name;
+        const std::wstring childPath = dir + L"\\" + name;
+
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+                continue;
+            if (!CollectApexFiles(childPath, childRel, files, error)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+            continue;
+
+        const size_t nameLen = name.size();
+        if (nameLen >= 9 &&
+            _wcsicmp(name.c_str() + nameLen - 9, L".apex.bak") == 0)
+            continue;
+
+        ArchiveEntry entry;
+        entry.path = childPath;
+        entry.rel  = childRel;
+        entry.size = (static_cast<uint64_t>(find.nFileSizeHigh) << 32) |
+                     static_cast<uint64_t>(find.nFileSizeLow);
+        files.push_back(std::move(entry));
+    } while (FindNextFileW(handle, &find));
+
+    FindClose(handle);
+    return ok;
+}
+
+constexpr char kApexArchiveMagic[8] = {'A', 'P', 'E', 'X', 'C', 'F', 'G', '1'};
+
+bool BuildApexArchive(const std::vector<ArchiveEntry>& files,
+                      std::string& archive, std::string& error) {
+    archive.clear();
+    archive.append(kApexArchiveMagic, sizeof(kApexArchiveMagic));
+    PutU32(archive, 1);
+    PutU32(archive, static_cast<uint32_t>(files.size()));
+
+    for (const ArchiveEntry& file : files) {
+        std::ifstream in(file.path, std::ios::binary);
+        if (!in) {
+            error = "could not read " + NarrowPath(file.path);
+            return false;
+        }
+        const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        const std::string rel = NarrowPath(file.rel);
+        PutU32(archive, static_cast<uint32_t>(rel.size()));
+        PutU64(archive, static_cast<uint64_t>(bytes.size()));
+        archive += rel;
+        archive += bytes;
+    }
+    return true;
+}
+
+bool SafeRelativePath(const std::string& rel) {
+    if (rel.empty() || rel.size() > 1024)
+        return false;
+    if (rel.find('\0') != std::string::npos)
+        return false;
+    if (rel[0] == '/' || rel[0] == '\\')
+        return false;
+    if (rel.find(':') != std::string::npos)
+        return false;
+
+    size_t start = 0;
+    while (start <= rel.size()) {
+        size_t end = rel.find_first_of("/\\", start);
+        if (end == std::string::npos)
+            end = rel.size();
+        const std::string part = rel.substr(start, end - start);
+        if (part.empty() || part == "." || part == "..")
+            return false;
+        if (part.back() == ' ' || part.back() == '.')
+            return false;
+        if (part.find_first_of("<>\"|?*") != std::string::npos)
+            return false;
+        for (unsigned char c : part)
+            if (c < 0x20)
+                return false;
+        if (end == rel.size())
+            break;
+        start = end + 1;
+    }
+    return true;
+}
+
+bool ChooseApexPath(HWND owner, bool save, std::wstring& path) {
+    wchar_t file[MAX_PATH] = L"Apex.apex";
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = owner;
-    ofn.lpstrFilter = L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFilter = L"APEX config (*.apex)\0*.apex\0All files (*.*)\0*.*\0\0";
     ofn.lpstrFile   = file;
     ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrTitle  = save ? L"Export all APEX settings"
-                           : L"Import APEX settings";
-    ofn.lpstrDefExt = L"json";
+    ofn.lpstrTitle  = save ? L"Export the APEX config"
+                           : L"Import the APEX config";
+    ofn.lpstrDefExt = L"apex";
     ofn.Flags       = OFN_NOCHANGEDIR |
                 (save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST)
                       : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST));
@@ -773,6 +1284,323 @@ bool ChooseJsonPath(HWND owner, bool save, std::wstring& path) {
 
     path = file;
     return true;
+}
+
+void ExportApexConfig(HWND owner) {
+    const std::string folder = videocfg::SavedGamesDir();
+    if (GetFileAttributesA(folder.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        Toast(Glass::Icon::XCircle, kWarn, "saved config not found", folder);
+        return;
+    }
+
+    std::vector<ArchiveEntry> files;
+    std::string               error;
+    if (!CollectApexFiles(WidenPath(folder), L"", files, error)) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not read the apex config",
+              error.empty() ? folder : error);
+        return;
+    }
+    if (files.empty()) {
+        Toast(Glass::Icon::XCircle, kWarn, "no config files to export", folder);
+        return;
+    }
+
+    std::wstring path;
+    if (!ChooseApexPath(owner, true, path))
+        return;
+
+    std::string archive;
+    if (!BuildApexArchive(files, archive, error)) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not export the apex config",
+              error);
+        return;
+    }
+
+    if (!WriteBinaryFileW(path, archive.data(), archive.size())) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not export the apex config",
+              NarrowPath(path));
+        return;
+    }
+
+    char count[64];
+    snprintf(count, sizeof(count), "%d file%s", static_cast<int>(files.size()),
+             files.size() == 1 ? "" : "s");
+    Toast(Glass::Icon::CheckCircle, kOk, "apex config exported",
+          std::string(count) + "  -  " + NarrowPath(path));
+}
+
+void ImportApexConfig(HWND owner) {
+    std::wstring path;
+    if (!ChooseApexPath(owner, false, path))
+        return;
+
+    std::string data;
+    if (!ReadTextFile(path, data)) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not read the file",
+              NarrowPath(path));
+        return;
+    }
+
+    if (data.size() < sizeof(kApexArchiveMagic) ||
+        memcmp(data.data(), kApexArchiveMagic, sizeof(kApexArchiveMagic)) != 0) {
+        Toast(Glass::Icon::XCircle, kWarn, "not an APEX config archive",
+              NarrowPath(path));
+        return;
+    }
+
+    size_t   pos     = sizeof(kApexArchiveMagic);
+    uint32_t version = 0;
+    uint32_t count   = 0;
+    if (!TakeU32(data, pos, version) || !TakeU32(data, pos, count) ||
+        version != 1 || count == 0 || count > 100000) {
+        Toast(Glass::Icon::XCircle, kWarn, "not an APEX config archive",
+              NarrowPath(path));
+        return;
+    }
+
+    struct ImportFile {
+        std::wstring rel;
+        const char*  data = nullptr;
+        size_t       size = 0;
+    };
+
+    std::vector<ImportFile> files;
+    bool                    invalid = false;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t relLen = 0;
+        uint64_t size   = 0;
+        if (!TakeU32(data, pos, relLen) || !TakeU64(data, pos, size) ||
+            relLen == 0 || relLen > 1024 || size > data.size() - pos ||
+            data.size() - pos < relLen) {
+            invalid = true;
+            break;
+        }
+
+        const std::string rel(data.data() + pos, relLen);
+        pos += relLen;
+
+        std::wstring wrel;
+        if (SafeRelativePath(rel))
+            wrel = WidenUtf8(rel);
+        if (wrel.empty()) {
+            invalid = true;
+            break;
+        }
+        std::replace(wrel.begin(), wrel.end(), L'/', L'\\');
+
+        files.push_back({wrel, data.data() + pos, static_cast<size_t>(size)});
+        pos += static_cast<size_t>(size);
+    }
+
+    if (invalid || files.empty()) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not import the apex config",
+              invalid ? "the archive is incomplete" : NarrowPath(path));
+        return;
+    }
+
+    const std::string  folder = videocfg::SavedGamesDir();
+    const std::wstring root   = WidenPath(folder);
+    const std::wstring parent = ParentDirW(root);
+    const std::wstring staging =
+        root + L".import-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(GetTickCount64());
+
+    EnsureDirectoryW(parent);
+    RemoveTreeW(staging);
+    EnsureDirectoryW(staging);
+
+    int extracted = 0;
+    for (const ImportFile& file : files) {
+        const std::wstring dest = staging + L"\\" + file.rel;
+        EnsureDirectoryW(ParentDirW(dest));
+        if (!WriteBinaryFileW(dest, file.data, file.size))
+            break;
+        ++extracted;
+    }
+
+    if (extracted != static_cast<int>(files.size())) {
+        RemoveTreeW(staging);
+        Toast(Glass::Icon::XCircle, kWarn, "could not import the apex config",
+              "could not write the saved config");
+        return;
+    }
+
+    bool        targetExisted = false;
+    std::string replaceError;
+    if (!ReplaceApexRoot(root, staging, targetExisted, replaceError)) {
+        RemoveTreeW(staging);
+        if (replaceError.empty())
+            Toast(Glass::Icon::XCircle, kWarn,
+                  "could not import the apex config", NarrowPath(path));
+        else
+            Toast(Glass::Icon::XCircle, kWarn,
+                  "could not replace the saved config", replaceError);
+        return;
+    }
+
+    char summary[96];
+    snprintf(summary, sizeof(summary), "%d file%s imported", extracted,
+             extracted == 1 ? "" : "s");
+
+    std::string detail = summary;
+    if (targetExisted)
+        detail += "  -  previous config kept as Apex.backup";
+    else
+        detail += "  -  " + folder;
+
+    Toast(Glass::Icon::CheckCircle, kOk, "apex config imported", detail);
+}
+
+void ExportApexFolder(HWND owner) {
+    const std::string  folder = videocfg::SavedGamesDir();
+    const std::wstring root   = WidenPath(folder);
+    const DWORD        attrs  = GetFileAttributesW(root.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        Toast(Glass::Icon::XCircle, kWarn, "saved config not found", folder);
+        return;
+    }
+
+    std::vector<std::wstring> files;
+    std::string               error;
+    if (!ListTreeFilesW(root, L"", files, error)) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not read the apex config",
+              error.empty() ? folder : error);
+        return;
+    }
+    if (files.empty()) {
+        Toast(Glass::Icon::XCircle, kWarn, "no config files to export", folder);
+        return;
+    }
+
+    std::wstring destParent;
+    if (!PickFolder(owner, L"Export the APEX config", DesktopDirW(),
+                    destParent))
+        return;
+
+    const std::wstring dest = destParent + L"\\Apex";
+    if (SamePathW(dest, root) || IsInsideW(dest, root)) {
+        Toast(Glass::Icon::XCircle, kWarn, "choose another folder",
+              "the saved config cannot be copied into itself");
+        return;
+    }
+
+    if (PathExistsW(dest)) {
+        const int confirm = MessageBoxW(
+            owner,
+            L"A folder named \"Apex\" already exists there.\n\n"
+            L"Replace it with a fresh copy?",
+            L"Export the APEX config",
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (confirm != IDYES)
+            return;
+        if (!RemoveTreeW(dest)) {
+            Toast(Glass::Icon::XCircle, kWarn,
+                  "could not replace the old export", NarrowPath(dest));
+            return;
+        }
+    }
+
+    EnsureDirectoryW(destParent);
+    if (!CopyTreeW(root, dest, error)) {
+        RemoveTreeW(dest);
+        Toast(Glass::Icon::XCircle, kWarn, "could not export the apex config",
+              error);
+        return;
+    }
+
+    char count[64];
+    snprintf(count, sizeof(count), "%d file%s copied  -  ",
+             static_cast<int>(files.size()), files.size() == 1 ? "" : "s");
+    Toast(Glass::Icon::CheckCircle, kOk, "apex config exported",
+          std::string(count) + NarrowPath(dest));
+}
+
+void ImportApexFolder(HWND owner) {
+    const std::string  folder = videocfg::SavedGamesDir();
+    const std::wstring root   = WidenPath(folder);
+
+    std::wstring selected;
+    if (!PickFolder(owner, L"Import the APEX config", ParentDirW(root),
+                    selected))
+        return;
+
+    const DWORD attrs = GetFileAttributesW(selected.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        Toast(Glass::Icon::XCircle, kWarn,
+              "could not read the selected folder", NarrowPath(selected));
+        return;
+    }
+
+    // Accept either the exported Apex folder itself or the folder that
+    // contains it (for example F:\Backups containing F:\Backups\Apex).
+    std::wstring src = selected;
+    if (_wcsicmp(BaseNameW(src).c_str(), L"Apex") != 0) {
+        const std::wstring nested = src + L"\\Apex";
+        if (PathExistsW(nested) && !PathExistsW(src + L"\\local") &&
+            !PathExistsW(src + L"\\profile"))
+            src = nested;
+    }
+
+    if (SamePathW(src, root)) {
+        Toast(Glass::Icon::XCircle, kWarn,
+              "this is already the saved config", NarrowPath(src));
+        return;
+    }
+    if (IsInsideW(src, root) || IsInsideW(root, src)) {
+        Toast(Glass::Icon::XCircle, kWarn,
+              "choose the exported Apex folder", NarrowPath(src));
+        return;
+    }
+
+    const std::wstring staging =
+        root + L".import-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(GetTickCount64());
+    RemoveTreeW(staging);
+
+    std::string error;
+    if (!CopyTreeW(src, staging, error)) {
+        RemoveTreeW(staging);
+        Toast(Glass::Icon::XCircle, kWarn,
+              "could not read the selected folder",
+              error.empty() ? NarrowPath(src) : error);
+        return;
+    }
+
+    std::vector<std::wstring> files;
+    if (!ListTreeFilesW(staging, L"", files, error) || files.empty()) {
+        RemoveTreeW(staging);
+        Toast(Glass::Icon::XCircle, kWarn,
+              "the selected folder is empty", NarrowPath(src));
+        return;
+    }
+
+    bool        targetExisted = false;
+    if (!ReplaceApexRoot(root, staging, targetExisted, error)) {
+        RemoveTreeW(staging);
+        if (error.empty())
+            Toast(Glass::Icon::XCircle, kWarn,
+                  "could not replace the saved config",
+                  "close Apex Legends and try again");
+        else
+            Toast(Glass::Icon::XCircle, kWarn,
+                  "could not replace the saved config", error);
+        return;
+    }
+
+    char summary[96];
+    snprintf(summary, sizeof(summary), "%d file%s imported",
+             static_cast<int>(files.size()), files.size() == 1 ? "" : "s");
+
+    std::string detail = summary;
+    if (targetExisted)
+        detail += "  -  previous config kept as Apex.backup";
+    else
+        detail += "  -  " + folder;
+
+    Toast(Glass::Icon::CheckCircle, kOk, "apex config imported", detail);
 }
 
 void ApplyImportedSettings() {
@@ -817,54 +1645,6 @@ void ApplyImportedSettings() {
     auto& engine = color::VibranceEngine::Get();
     engine.Load();
     engine.ApplyNow();
-}
-
-void ExportSettingsJson(HWND owner) {
-    auto& engine = color::VibranceEngine::Get();
-    engine.Save();
-
-    std::wstring path;
-    if (!ChooseJsonPath(owner, true, path))
-        return;
-
-    const std::string json =
-        BuildSettingsJson(ReadIniDoc(settings::AppIniPath()),
-                          ReadIniDoc(engine.SettingsPath()));
-    if (WriteTextFile(path, json))
-        Toast(Glass::Icon::CheckCircle, kOk, "settings exported", NarrowPath(path));
-    else
-        Toast(Glass::Icon::XCircle, kWarn, "could not export the settings",
-              NarrowPath(path));
-}
-
-void ImportSettingsJson(HWND owner) {
-    std::wstring path;
-    if (!ChooseJsonPath(owner, false, path))
-        return;
-
-    std::string text;
-    if (!ReadTextFile(path, text)) {
-        Toast(Glass::Icon::XCircle, kWarn, "could not read the file",
-              NarrowPath(path));
-        return;
-    }
-
-    IniDoc app;
-    IniDoc vibrance;
-    if (!ParseSettingsJson(text, app, vibrance) ||
-        (app.empty() && vibrance.empty())) {
-        Toast(Glass::Icon::XCircle, kWarn, "not an APEX settings file",
-              NarrowPath(path));
-        return;
-    }
-
-    if (!app.empty())
-        WriteIniDoc(settings::AppIniPath(), app);
-    if (!vibrance.empty())
-        WriteIniDoc(color::VibranceEngine::Get().SettingsPath(), vibrance);
-
-    ApplyImportedSettings();
-    Toast(Glass::Icon::CheckCircle, kOk, "settings imported", NarrowPath(path));
 }
 
 void Toast(Glass::Icon icon, ImU32 tile, const char* title, const std::string& message) {
@@ -1165,28 +1945,21 @@ bool DrawAppProfileWindow(color::VibranceEngine& engine, const std::string& exe,
 void App::DrawVideoCfg() {
     using namespace videocfg;
 
-    const Report report = Snapshot();
-
-    char installedText[32];
-    snprintf(installedText, sizeof(installedText), "%d / 3", InstalledCount());
+    const std::string configDir = SavedGamesDir();
+    const bool configFound =
+        GetFileAttributesA(configDir.c_str()) != INVALID_FILE_ATTRIBUTES;
 
     char gameText[24];
     snprintf(gameText, sizeof(gameText), "%s", GameFound() ? "found" : "not found");
 
-    char statusText[32];
-    if (report.running)
-        snprintf(statusText, sizeof(statusText), "%d / %d", report.done, report.total);
-    else if (report.finished)
-        snprintf(statusText, sizeof(statusText), "%s",
-                 report.ok ? "installed" : "partial");
-    else
-        snprintf(statusText, sizeof(statusText), "idle");
+    char configText[24];
+    snprintf(configText, sizeof(configText), "%s",
+             configFound ? "found" : "missing");
 
-    const char* labels[3] = {"files installed", "apex", "status"};
-    const char* values[3] = {installedText, gameText, statusText};
-    const bool  accents[3] = {InstalledCount() > 0, GameFound(),
-                              report.running || (report.finished && report.ok)};
-    StatTileRow(fontSemi, labels, values, accents, 3);
+    const char* labels[2] = {"apex", "saved config"};
+    const char* values[2] = {gameText, configText};
+    const bool  accents[2] = {GameFound(), configFound};
+    StatTileRow(fontSemi, labels, values, accents, 2);
 
     NavScrollTo(static_cast<int>(Section::VideoCfg), 0);
     Glass::BeginPanel("apex legends");
@@ -1224,59 +1997,17 @@ void App::DrawVideoCfg() {
     NavScrollTo(static_cast<int>(Section::VideoCfg), 1);
     Glass::BeginPanel("apex video cfg");
 
-    InfoRow("repository", "kerubim-code / APEX-SETTINGS");
-    InfoRow("game folder", SavedGamesDir().c_str());
+    InfoRow("game folder", configDir.c_str());
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
 
-    const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    if (report.running)
-        ImGui::BeginDisabled();
-    const bool installPressed =
-        Glass::Button("download and install", true, ImVec2(half, 46.0f));
-    if (report.running)
-        ImGui::EndDisabled();
-    if (installPressed)
-        StartInstall();
-
-    ImGui::SameLine(0.0f, 12.0f);
-    if (Glass::Button("open the game folder", false, ImVec2(half, 46.0f)))
-        ShellExecuteA(nullptr, "open", SavedGamesDir().c_str(), nullptr, nullptr,
-                      SW_SHOWNORMAL);
-
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
-
-    if (report.running) {
-        const float frac =
-            report.total > 0 ? static_cast<float>(report.done) / report.total : 0.0f;
-        Glass::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x, 8.0f));
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    } else if (report.finished) {
-        Glass::StatusPill(report.ok ? "all files installed" : "some files failed",
-                          report.ok ? kOk : kWarn);
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    }
-
-    if (!report.lines.empty()) {
-        Glass::SectionHeader("download log");
-        ImGui::Dummy(ImVec2(0.0f, 4.0f));
-
-        const GlassClip parent;
-        float logH = 14.0f + static_cast<float>(report.lines.size()) * 19.0f;
-        if (logH > 224.0f) logH = 224.0f;
-
-        ImGui::BeginChild("apex_cfg_log", ImVec2(ImGui::GetContentRegionAvail().x, logH),
-                          ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-        parent.ClipHere();
-
-        for (const auto& line : report.lines) {
-            const bool failed = line.rfind("failed", 0) == 0;
-            ImGui::PushStyleColor(ImGuiCol_Text, failed ? kWarn : kInk);
-            ImGui::TextUnformatted(line.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::EndChild();
-        parent.Restore();
+    if (Glass::Button("open the game folder", true,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 46.0f))) {
+        if (!configFound)
+            Toast(Glass::Icon::XCircle, kWarn, "saved config not found",
+                  configDir);
+        else
+            ShellExecuteA(nullptr, "open", configDir.c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
     }
 
     Glass::EndPanel();
@@ -2442,15 +3173,34 @@ void App::DrawConfig() {
 
     InfoRow("app settings", settings::AppIniPath().c_str());
     InfoRow("colour settings", engine.SettingsPath().c_str());
+    InfoRow("apex config", videocfg::SavedGamesDir().c_str());
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
 
     if (Glass::Button("export all settings", true, ImVec2(half, 44.0f)))
-        ExportSettingsJson(Window());
+        ExportApexFolder(Window());
     ImGui::SameLine(0.0f, 12.0f);
     if (Glass::Button("import settings", false, ImVec2(half, 44.0f)))
-        ImportSettingsJson(Window());
+        ImportApexFolder(Window());
+
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped(
+        "export copies the whole Apex folder where you choose; import replaces "
+        "the saved Apex folder with the folder you choose.");
+    ImGui::PopStyleColor();
+
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+    if (Glass::Button("open saved config", false,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
+        const std::string folder = videocfg::SavedGamesDir();
+        if (GetFileAttributesA(folder.c_str()) == INVALID_FILE_ATTRIBUTES)
+            Toast(Glass::Icon::XCircle, kWarn, "saved config not found", folder);
+        else
+            ShellExecuteA(nullptr, "open", folder.c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
+    }
 
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
 

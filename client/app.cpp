@@ -524,7 +524,7 @@ void App::DrawSidebar(const ImVec2& origin, float height) {
                                                    IM_COL32(188, 196, 214, 255),
                                                    IM_COL32(176, 102, 255, 255)};
 
-    static const char* kSubsVideo[]   = {"launch", "install", "files"};
+    static const char* kSubsVideo[]   = {"launch", "config", "files"};
     static const char* kSubsCustom[]  = {"resolution", "fov", "textures",
                                          "antialiasing", "gamma"};
     static const char* kSubsColor[]   = {"profile", "detect", "rules"};
