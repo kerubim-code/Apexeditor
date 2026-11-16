@@ -6,6 +6,7 @@
 #include <gdiplus.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace apex::crosshair {
@@ -24,6 +25,34 @@ float     g_rgb[3]  = {1.0f, 1.0f, 1.0f};
 bool      g_dirty   = true;
 int       g_lastCol = -1;
 bool      g_class   = false;
+unsigned char g_grid[kGridSize * kGridSize] = {};
+bool      g_gridDirty = false;
+
+void LoadGridInternal() {
+    char text[kGridSize * kGridSize + 8] = {};
+    GetPrivateProfileStringA("app", "crosshair_grid", "", text, sizeof(text),
+                             settings::AppIniPath().c_str());
+    const size_t len = strlen(text);
+    if (len == static_cast<size_t>(kGridSize * kGridSize)) {
+        for (int i = 0; i < kGridSize * kGridSize; ++i)
+            g_grid[i] = text[i] == '1' ? 1 : 0;
+    } else {
+        memset(g_grid, 0, sizeof(g_grid));
+    }
+    g_gridDirty = false;
+    g_dirty     = true;
+}
+
+void SaveGridInternal() {
+    if (!g_gridDirty)
+        return;
+    char text[kGridSize * kGridSize + 1] = {};
+    for (int i = 0; i < kGridSize * kGridSize; ++i)
+        text[i] = g_grid[i] ? '1' : '0';
+    WritePrivateProfileStringA("app", "crosshair_grid", text,
+                               settings::AppIniPath().c_str());
+    g_gridDirty = false;
+}
 
 int PackedColor() {
     const int r = static_cast<int>(g_rgb[0] * 255.0f + 0.5f);
@@ -111,6 +140,19 @@ void Render() {
                 g.DrawLines(&pen, pts, 5);
                 break;
             }
+            case 5: {
+                Gdiplus::SolidBrush brush(col);
+                const float span = s * 2.0f;
+                const float cell = span / static_cast<float>(kGridSize);
+                const float left = c - s;
+                for (int y = 0; y < kGridSize; ++y)
+                    for (int x = 0; x < kGridSize; ++x)
+                        if (g_grid[y * kGridSize + x])
+                            g.FillRectangle(&brush, left + x * cell,
+                                            left + y * cell, cell + 0.05f,
+                                            cell + 0.05f);
+                break;
+            }
             default: {
                 Gdiplus::Pen pen(col, t);
                 g.DrawLine(&pen, c, c - s, c, c + s);
@@ -149,10 +191,11 @@ bool Create() {
         return false;
 
     g_on    = settings::GetBool("crosshair_on", false);
-    g_shape = std::max(0, std::min(4, settings::GetInt("crosshair_shape", 0)));
+    g_shape = std::max(0, std::min(5, settings::GetInt("crosshair_shape", 0)));
     g_size  = std::max(2, std::min(50, settings::GetInt("crosshair_size", 10)));
     g_thick = std::max(1, std::min(5, settings::GetInt("crosshair_thickness", 1)));
     ApplyColor(settings::GetInt("crosshair_color", 0xFFFFFF));
+    LoadGridInternal();
 
     if (!g_class) {
         WNDCLASSEXW wc = {sizeof(wc)};
@@ -253,7 +296,7 @@ int Shape() {
 }
 
 void SetShape(int shape) {
-    g_shape = std::max(0, std::min(4, shape));
+    g_shape = std::max(0, std::min(5, shape));
     settings::SetInt("crosshair_shape", g_shape);
     g_dirty = true;
 }
@@ -280,6 +323,42 @@ void SetThickness(int thickness) {
 
 float* Rgb() {
     return g_rgb;
+}
+
+int GridSize() {
+    return kGridSize;
+}
+
+bool GridPixel(int x, int y) {
+    if (x < 0 || x >= kGridSize || y < 0 || y >= kGridSize)
+        return false;
+    return g_grid[y * kGridSize + x] != 0;
+}
+
+void SetGridPixel(int x, int y, bool on) {
+    if (x < 0 || x >= kGridSize || y < 0 || y >= kGridSize)
+        return;
+    const unsigned char value = on ? 1 : 0;
+    unsigned char&      cell  = g_grid[y * kGridSize + x];
+    if (cell == value)
+        return;
+    cell        = value;
+    g_dirty     = true;
+    g_gridDirty = true;
+}
+
+void ClearGrid() {
+    memset(g_grid, 0, sizeof(g_grid));
+    g_dirty     = true;
+    g_gridDirty = true;
+}
+
+void SaveGrid() {
+    SaveGridInternal();
+}
+
+void ReloadGrid() {
+    LoadGridInternal();
 }
 
 }

@@ -11,10 +11,19 @@
 
 namespace apex::crosshair {
 
+constexpr int kGridSize = 32;
+
 bool Create();
 void Destroy();
 void Tick();
 HWND Window();
+
+int  GridSize();
+bool GridPixel(int x, int y);
+void SetGridPixel(int x, int y, bool on);
+void ClearGrid();
+void SaveGrid();
+void ReloadGrid();
 
 void  Toggle();
 void  SetEnabled(bool on);

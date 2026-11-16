@@ -149,7 +149,56 @@ bool Slider(const char* label, float* v, float vmin, float vmax, const char* fmt
     ImGui::SameLine(0.0f, 12.0f);
     ImGui::AlignTextToFramePadding();
     char buf[64]; std::snprintf(buf, sizeof(buf), fmt, *v);
-    ImGui::Text("%s  %s", label, buf);
+    const ImVec2 textPos = ImGui::GetCursorScreenPos();
+    const float labelW   = ImGui::CalcTextSize(label).x;
+    const float gapW     = ImGui::CalcTextSize("  ").x;
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0.0f, gapW);
+    const ImVec2 valPos(textPos.x + labelW + gapW, textPos.y);
+    ImGui::SetCursorScreenPos(valPos);
+
+    static ImGuiID editId = 0;
+    static char    editBuf[64] = "";
+    static bool    editFocus = false;
+    const ImGuiID  valId = ImGui::GetID("##value");
+    const float    valW  = ImGui::CalcTextSize(buf).x;
+    const float    valH  = ImGui::GetTextLineHeight();
+
+    if (editId == valId) {
+        ImGui::SetCursorScreenPos(ImVec2(valPos.x - US(4.0f), valPos.y - US(3.0f)));
+        ImGui::SetNextItemWidth(std::max(US(96.0f), valW + US(34.0f)));
+        if (editFocus) { ImGui::SetKeyboardFocusHere(); editFocus = false; }
+        const bool enter = ImGui::InputText(
+            "##edit", editBuf, sizeof(editBuf),
+            ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue |
+                ImGuiInputTextFlags_AutoSelectAll);
+        const bool done = enter || ImGui::IsItemDeactivated();
+        if (done) {
+            char* end = nullptr;
+            const double parsed = std::strtod(editBuf, &end);
+            if (end != editBuf)
+                *v = Clampf(static_cast<float>(parsed), vmin, vmax);
+            editId = 0;
+            ImGui::PopID();
+            return true;
+        }
+    } else {
+        ImGui::InvisibleButton("##vbtn", ImVec2(std::max(valW, US(24.0f)) + US(8.0f), valH));
+        const bool vhov = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) {
+            editId    = valId;
+            editFocus = true;
+            std::snprintf(editBuf, sizeof(editBuf), "%g", *v);
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImU32 vc = vhov ? AccentCol() : ImGui::GetColorU32(ImGuiCol_Text);
+        dl->AddText(valPos, vc, buf);
+        if (vhov)
+            dl->AddLine(ImVec2(valPos.x, valPos.y + valH + US(1.0f)),
+                        ImVec2(valPos.x + valW, valPos.y + valH + US(1.0f)), vc,
+                        US(1.0f));
+    }
+
     ImGui::PopID();
     return active;
 }

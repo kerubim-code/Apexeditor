@@ -29,6 +29,8 @@ void        Deselect();
 void        RemoveSelected();
 float       Opacity();
 void        SetOpacity(float opacity);
+float       Rotation();
+void        SetRotation(float degrees);
 
 bool AddFromDialog(int type);
 

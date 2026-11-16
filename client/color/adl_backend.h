@@ -105,8 +105,13 @@ public:
     static int MapSaturation(const DisplayTarget& target, int appValue);
 
     bool SetSaturationOnAll(int appValue) const;
+    bool SetColorOnAll(int flag, int appValue) const;
 
     bool RestoreSaturation() const;
+    bool RestoreColorOnAll(int flag) const;
+
+    bool HueAvailable() const;
+    bool TemperatureAvailable() const;
 
     std::string BackendName() const;
 
@@ -120,6 +125,8 @@ private:
     std::string        error_;
 
     std::vector<DisplayTarget> displays_;
+    bool hueSupported_ = false;
+    bool temperatureSupported_ = false;
 
     int (*create_)(void* (*)(int), int) = nullptr;
     int (*destroy_)() = nullptr;

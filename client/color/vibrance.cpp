@@ -108,7 +108,9 @@ bool VibranceEngine::Start() {
 
     {
         std::lock_guard lock(mutex_);
-        satCacheValid_ = false;
+        satCacheValid_  = false;
+        hueCacheValid_  = false;
+        tempCacheValid_ = false;
     }
 
     ApplyNow(true);
@@ -127,12 +129,16 @@ void VibranceEngine::Stop() {
         Save();
 
     AdlBackend::Get().RestoreSaturation();
+    AdlBackend::Get().RestoreColorOnAll(kColorHue);
+    AdlBackend::Get().RestoreColorOnAll(kColorTemperature);
     GammaBackend::Get().Reset();
 
     {
         std::lock_guard lock(mutex_);
-        satCacheValid_ = false;
-        dirty_         = false;
+        satCacheValid_  = false;
+        hueCacheValid_  = false;
+        tempCacheValid_ = false;
+        dirty_          = false;
     }
 
     AdlBackend::Get().Shutdown();
@@ -228,6 +234,38 @@ void VibranceEngine::SetGamma(float value) {
     gamma_ = ClampFloat(value, 0.50f, 2.00f);
     pending_ = true;
     MarkDirtyLocked();
+}
+
+int VibranceEngine::Hue() const {
+    std::lock_guard lock(mutex_);
+    return hue_;
+}
+
+void VibranceEngine::SetHue(int value) {
+    std::lock_guard lock(mutex_);
+    hue_ = std::max(kSaturationMin, std::min(value, kSaturationMax));
+    pending_ = true;
+    MarkDirtyLocked();
+}
+
+int VibranceEngine::Temperature() const {
+    std::lock_guard lock(mutex_);
+    return temperature_;
+}
+
+void VibranceEngine::SetTemperature(int value) {
+    std::lock_guard lock(mutex_);
+    temperature_ = std::max(kSaturationMin, std::min(value, kSaturationMax));
+    pending_ = true;
+    MarkDirtyLocked();
+}
+
+bool VibranceEngine::HueAvailable() const {
+    return AdlBackend::Get().HueAvailable();
+}
+
+bool VibranceEngine::TemperatureAvailable() const {
+    return AdlBackend::Get().TemperatureAvailable();
 }
 
 std::vector<AppRule> VibranceEngine::Rules() const {
@@ -327,10 +365,39 @@ void VibranceEngine::ApplySaturation(int value, bool force) {
     satCacheValid_ = true;
 }
 
+void VibranceEngine::ApplyExtraColor(int flag, int value, bool force) {
+    auto& adl = AdlBackend::Get();
+    if (!adl.Ready()) return;
+
+    int*  cache = (flag == kColorHue) ? &hueCache_ : &tempCache_;
+    bool* valid = (flag == kColorHue) ? &hueCacheValid_ : &tempCacheValid_;
+
+    if (!force && *valid && value == *cache) return;
+
+    adl.SetColorOnAll(flag, value);
+    *cache = value;
+    *valid = true;
+}
+
 void VibranceEngine::ApplyLocked(bool force) {
     const int target = TargetSaturationLocked();
     ApplySaturation(target, force);
     appliedSat_ = target;
+
+    int hue  = kSaturationDefault;
+    int temp = kSaturationDefault;
+    if (enabled_) {
+        const AppRule* rule = RuleInFrontLocked();
+        if (rule != nullptr) {
+            hue  = std::max(kSaturationMin, std::min(rule->hue, kSaturationMax));
+            temp = std::max(kSaturationMin, std::min(rule->temperature, kSaturationMax));
+        } else {
+            hue  = hue_;
+            temp = temperature_;
+        }
+    }
+    ApplyExtraColor(kColorHue, hue, force);
+    ApplyExtraColor(kColorTemperature, temp, force);
 
     auto& gamma = GammaBackend::Get();
     if (gamma.Ready()) {
@@ -432,21 +499,42 @@ bool VibranceEngine::Load() {
 
             AppRule rule;
             rule.exe = key;
-            const auto comma = value.find(',');
-            rule.saturation = std::max(
-                kSaturationMin,
-                std::min(atoi(value.substr(0, comma).c_str()), kSaturationMax));
-            if (comma != std::string::npos) {
-                std::istringstream rest(value.substr(comma + 1));
-                std::string b, c, g;
-                if (std::getline(rest, b, ',') && std::getline(rest, c, ',') &&
-                    std::getline(rest, g, ',')) {
-                    rule.levels     = true;
-                    rule.brightness = ClampFloat(static_cast<float>(atof(b.c_str())), 0.50f, 1.50f);
-                    rule.contrast   = ClampFloat(static_cast<float>(atof(c.c_str())), 0.50f, 1.50f);
-                    rule.gamma      = ClampFloat(static_cast<float>(atof(g.c_str())), 0.50f, 2.00f);
-                }
+
+            std::vector<std::string> parts;
+            {
+                std::istringstream stream(value);
+                std::string        part;
+                while (std::getline(stream, part, ','))
+                    parts.push_back(Trim(part));
             }
+
+            const auto clampNeutral = [](const std::string& text) {
+                return std::max(kSaturationMin,
+                                std::min(atoi(text.c_str()), kSaturationMax));
+            };
+            const auto readLevels = [&](size_t offset) {
+                rule.levels     = true;
+                rule.brightness = ClampFloat(static_cast<float>(atof(parts[offset].c_str())), 0.50f, 1.50f);
+                rule.contrast   = ClampFloat(static_cast<float>(atof(parts[offset + 1].c_str())), 0.50f, 1.50f);
+                rule.gamma      = ClampFloat(static_cast<float>(atof(parts[offset + 2].c_str())), 0.50f, 2.00f);
+            };
+
+            if (!parts.empty())
+                rule.saturation = clampNeutral(parts[0]);
+
+            if (parts.size() == 3) {
+                rule.hue         = clampNeutral(parts[1]);
+                rule.temperature = clampNeutral(parts[2]);
+            } else if (parts.size() == 6) {
+                rule.hue         = clampNeutral(parts[1]);
+                rule.temperature = clampNeutral(parts[2]);
+                readLevels(3);
+            } else if (parts.size() == 4) {
+                rule.hue         = kSaturationDefault;
+                rule.temperature = kSaturationDefault;
+                readLevels(1);
+            }
+
             if (!rule.exe.empty()) loadedRules.push_back(rule);
             continue;
         }
@@ -455,6 +543,10 @@ bool VibranceEngine::Load() {
         if (key == "enabled")          enabled_ = (value != "0");
         else if (key == "saturation")   desktopSat_ = std::max(kSaturationMin,
                                                               std::min(atoi(value.c_str()), kSaturationMax));
+        else if (key == "hue")          hue_ = std::max(kSaturationMin,
+                                                       std::min(atoi(value.c_str()), kSaturationMax));
+        else if (key == "temperature")  temperature_ = std::max(kSaturationMin,
+                                                               std::min(atoi(value.c_str()), kSaturationMax));
         else if (key == "brightness")   brightness_ = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 1.50f);
         else if (key == "contrast")     contrast_   = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 1.50f);
         else if (key == "gamma")        gamma_      = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 2.00f);
@@ -484,12 +576,16 @@ bool VibranceEngine::Save() const {
     out << "brightness=" << brightness_ << "\n";
     out << "contrast=" << contrast_ << "\n";
     out << "gamma=" << gamma_ << "\n";
+    out << "hue=" << hue_ << "\n";
+    out << "temperature=" << temperature_ << "\n";
     out << "\n; one profile per application\n";
-    out << ";   exe=saturation\n";
-    out << ";   exe=saturation,brightness,contrast,gamma   (per application levels)\n";
+    out << ";   exe=saturation,hue,temperature\n";
+    out << ";   exe=saturation,hue,temperature,brightness,contrast,gamma   (with levels)\n";
     out << "[apps]\n";
     for (const auto& rule : rules_) {
-        out << rule.exe << '=' << rule.saturation;
+        out << rule.exe << '=' << rule.saturation
+            << ',' << rule.hue
+            << ',' << rule.temperature;
         if (rule.levels)
             out << ',' << rule.brightness << ',' << rule.contrast << ',' << rule.gamma;
         out << '\n';

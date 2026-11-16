@@ -46,10 +46,6 @@ ID3D11RenderTargetView* g_rtView        = nullptr;
 bool                    g_occluded      = false;
 UINT                    g_resizeW = 0, g_resizeH = 0;
 
-bool  g_itemHover = false;
-bool  g_dragging  = false;
-POINT g_dragPt{};
-
 constexpr int     kOvrW = 440, kOvrH = 196;
 HWND             g_ovrHwnd      = nullptr;
 IDXGISwapChain*  g_ovrSwap      = nullptr;
@@ -65,20 +61,49 @@ bool             g_ovrInited     = false;
 bool             g_ovrDragging   = false;
 POINT            g_ovrDragPt{};
 
-bool IsDragZone(HWND hWnd, int x, int y) {
-    RECT rc{};
-    if (!GetClientRect(hWnd, &rc))
-        return false;
-    const int m = 46;
-    const bool zone = (x < m || y < m || x > rc.right - m || y > rc.bottom - m) ||
-                      (x < m + static_cast<int>(apex::kSidebarWidth));
-    if (g_itemHover)
-        return false;
-    return zone;
-}
-
 Glass::Backdrop         g_backdrop;
 Glass::Renderer         g_renderer;
+
+// Solid black source for the glass shader when gui transparency is off: every
+// surface keeps the liquid glass reflections but samples black instead of the
+// desktop, which gives the clean black default background.
+ID3D11ShaderResourceView* g_blackSRV = nullptr;
+
+bool CreateBlackSRV() {
+    if (g_device == nullptr || g_blackSRV != nullptr)
+        return g_blackSRV != nullptr;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width            = 1;
+    desc.Height           = 1;
+    desc.MipLevels        = 1;
+    desc.ArraySize        = 1;
+    desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage            = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+    const UINT pixel = 0xFF000000u;
+
+    D3D11_SUBRESOURCE_DATA data{};
+    data.pSysMem     = &pixel;
+    data.SysMemPitch = sizeof(pixel);
+
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g_device->CreateTexture2D(&desc, &data, &tex)) || tex == nullptr)
+        return false;
+
+    const HRESULT hr = g_device->CreateShaderResourceView(tex, nullptr, &g_blackSRV);
+    tex->Release();
+    return SUCCEEDED(hr) && g_blackSRV != nullptr;
+}
+
+void ReleaseBlackSRV() {
+    if (g_blackSRV != nullptr) {
+        g_blackSRV->Release();
+        g_blackSRV = nullptr;
+    }
+}
 
 constexpr int kWindowW = 1240;
 constexpr int kWindowH = 780;
@@ -223,6 +248,7 @@ bool CreateDeviceD3D(HWND hWnd) {
         return false;
 
     CreateRenderTarget();
+    CreateBlackSRV();
     return true;
 }
 
@@ -243,6 +269,7 @@ void CleanupRenderTarget() {
 }
 
 void CleanupDeviceD3D() {
+    ReleaseBlackSRV();
     CleanupRenderTarget();
     if (g_swapChain != nullptr)  { g_swapChain->Release();  g_swapChain = nullptr; }
     if (g_context != nullptr)    { g_context->Release();    g_context = nullptr; }
@@ -322,6 +349,26 @@ ImFont* AddIconFont(ImFontAtlas* atlas, const char* rel, int resId, float size) 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
+        case WM_NCHITTEST: {
+            POINT p = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ScreenToClient(hWnd, &p);
+            RECT cr{};
+            if (GetClientRect(hWnd, &cr)) {
+                // The visible glass card is inset 46 px inside the window.
+                const int edge = 46;
+                const int band = 18;
+                const int lo   = edge - 2;
+                const int hi   = edge + band;
+                const bool left   = p.x >= lo && p.x < hi;
+                const bool right  = p.x >= cr.right - hi && p.x < cr.right - lo;
+                const bool top    = p.y >= lo && p.y < hi;
+                const bool bottom = p.y >= cr.bottom - hi && p.y < cr.bottom - lo;
+                const bool topFree = top && p.x < cr.right - 340;
+                if (left || right || bottom || topFree)
+                    return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
         case WM_HOTKEY: {
 
             const int slot = static_cast<int>(wParam) - 0x5001;
@@ -341,54 +388,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
-        case WM_LBUTTONDOWN: {
-            const int x = GET_X_LPARAM(lParam);
-            const int y = GET_Y_LPARAM(lParam);
-            if (IsDragZone(hWnd, x, y)) {
-                g_dragging = true;
-                g_dragPt.x = x;
-                g_dragPt.y = y;
-                SetCapture(hWnd);
-                return 0;
-            }
-            break;
-        }
-        case WM_MOUSEMOVE:
-            if (g_dragging) {
-                const int x = GET_X_LPARAM(lParam);
-                const int y = GET_Y_LPARAM(lParam);
-
-                RECT now{};
-                GetWindowRect(hWnd, &now);
-                int nx = now.left + (x - g_dragPt.x);
-                int ny = now.top + (y - g_dragPt.y);
-
-                const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                const int ww = now.right - now.left;
-                const int wh = now.bottom - now.top;
-                const int keep = 80;
-                if (nx > vx + vw - keep) nx = vx + vw - keep;
-                if (ny > vy + vh - keep) ny = vy + vh - keep;
-                if (nx < vx + keep - ww) nx = vx + keep - ww;
-                if (ny < vy + keep - wh) ny = vy + keep - wh;
-                SetWindowPos(hWnd, nullptr, nx, ny, 0, 0,
-                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                return 0;
-            }
-            break;
-        case WM_LBUTTONUP:
-            if (g_dragging) {
-                g_dragging = false;
-                ReleaseCapture();
-                return 0;
-            }
-            break;
-        case WM_CAPTURECHANGED:
-            g_dragging = false;
-            break;
     }
 
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
@@ -981,8 +980,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
         Glass::DrawNotifications(static_cast<float>(cw), static_cast<float>(ch));
 
-        g_itemHover = ImGui::IsAnyItemHovered();
-
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsAnyItemHovered() &&
             !Glass::SfxConsumed())
             Glass::PlaySfx(Glass::Sfx::Tap);
@@ -1001,7 +998,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         vp.Height   = static_cast<float>(ch);
         vp.MaxDepth = 1.0f;
         g_context->RSSetViewports(1, &vp);
-        g_renderer.Render(g_backdrop.heavySRV(), g_backdrop.softSRV());
+        const bool useBlack = !apex::g_guiTransparency && g_blackSRV != nullptr;
+        g_renderer.Render(useBlack ? g_blackSRV : g_backdrop.heavySRV(),
+                          useBlack ? g_blackSRV : g_backdrop.softSRV());
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         if (doBlur && backdropOk) {

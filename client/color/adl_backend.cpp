@@ -26,6 +26,30 @@ T Resolve(HMODULE module, const char* name) {
     return reinterpret_cast<T>(GetProcAddress(module, name));
 }
 
+int MapNeutralValue(const ColorValue& value, int appValue) {
+    double input = static_cast<double>(appValue);
+    if (input < kAmdValueMin) input = kAmdValueMin;
+    if (input > kAmdValueMax) input = kAmdValueMax;
+
+    const double neutral = static_cast<double>(value.fallback);
+    double       mapped  = neutral;
+
+    if (input <= static_cast<double>(kAmdValueDefault)) {
+        const double t = (static_cast<double>(kAmdValueDefault) - input) /
+                         static_cast<double>(kAmdValueDefault);
+        mapped = neutral - t * (neutral - static_cast<double>(value.minimum));
+    } else {
+        const double t = (input - static_cast<double>(kAmdValueDefault)) /
+                         static_cast<double>(kAmdValueMax - kAmdValueDefault);
+        mapped = neutral + t * (static_cast<double>(value.maximum) - neutral);
+    }
+
+    const int rounded = static_cast<int>(mapped >= 0.0 ? mapped + 0.5 : mapped - 0.5);
+    if (rounded < value.minimum) return value.minimum;
+    if (rounded > value.maximum) return value.maximum;
+    return rounded;
+}
+
 }
 
 AdlBackend& AdlBackend::Get() {
@@ -120,6 +144,20 @@ bool AdlBackend::Init() {
             }
 
             displays_.push_back(target);
+
+            {
+                int current = 0, fallback = 0, minimum = 0, maximum = 0, settable = 0;
+                if (!hueSupported_ &&
+                    colorGet_(target.adapterIndex, target.displayIndex, kColorHue,
+                              &current, &fallback, &minimum, &maximum, &settable) == kAdlSuccess &&
+                    minimum < maximum)
+                    hueSupported_ = true;
+                if (!temperatureSupported_ &&
+                    colorGet_(target.adapterIndex, target.displayIndex, kColorTemperature,
+                              &current, &fallback, &minimum, &maximum, &settable) == kAdlSuccess &&
+                    minimum < maximum)
+                    temperatureSupported_ = true;
+            }
         }
 
         CoTaskMemFree(buffer);
@@ -138,6 +176,8 @@ bool AdlBackend::Init() {
 void AdlBackend::Shutdown() {
 
     RestoreSaturation();
+    RestoreColorOnAll(kColorHue);
+    RestoreColorOnAll(kColorTemperature);
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (module_ != nullptr) {
@@ -230,6 +270,40 @@ bool AdlBackend::RestoreSaturation() const {
         any = SetColor(target, kColorSaturation, target.saturationDefault) || any;
     }
     return any;
+}
+
+bool AdlBackend::SetColorOnAll(int flag, int appValue) const {
+    const auto targets = Displays();
+    bool any = false;
+    for (const auto& target : targets) {
+        ColorValue current;
+        if (!GetColor(target, flag, current) || !current.settable)
+            continue;
+        any = SetColor(target, flag, MapNeutralValue(current, appValue)) || any;
+    }
+    return any;
+}
+
+bool AdlBackend::RestoreColorOnAll(int flag) const {
+    const auto targets = Displays();
+    bool any = false;
+    for (const auto& target : targets) {
+        ColorValue current;
+        if (!GetColor(target, flag, current) || !current.settable)
+            continue;
+        any = SetColor(target, flag, current.fallback) || any;
+    }
+    return any;
+}
+
+bool AdlBackend::HueAvailable() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ready_ && hueSupported_;
+}
+
+bool AdlBackend::TemperatureAvailable() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ready_ && temperatureSupported_;
 }
 
 std::string AdlBackend::BackendName() const {

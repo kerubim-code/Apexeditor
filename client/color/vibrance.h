@@ -12,6 +12,8 @@ namespace apex::color {
 struct AppRule {
     std::string exe;
     int         saturation = 150;
+    int         hue        = 100;
+    int         temperature = 100;
 
     bool  levels    = false;
     float brightness = 1.0f;
@@ -48,6 +50,15 @@ public:
     float  Gamma() const;
     void   SetGamma(float value);
 
+    int    Hue() const;
+    void   SetHue(int value);
+
+    int    Temperature() const;
+    void   SetTemperature(int value);
+
+    bool   HueAvailable() const;
+    bool   TemperatureAvailable() const;
+
     std::vector<AppRule> Rules() const;
     void   SetRules(const std::vector<AppRule>& rules);
 
@@ -77,6 +88,7 @@ private:
     const AppRule* RuleInFrontLocked() const;
     void   ApplyLocked(bool force);
     void   ApplySaturation(int value, bool force);
+    void   ApplyExtraColor(int flag, int value, bool force);
 
     void   MarkDirtyLocked();
     void   FlushDirty() const;
@@ -90,6 +102,8 @@ private:
     float  brightness_      = 1.0f;
     float  contrast_        = 1.0f;
     float  gamma_           = 1.0f;
+    int    hue_             = 100;
+    int    temperature_     = 100;
     std::vector<AppRule> rules_;
 
     std::string foreground_;
@@ -97,6 +111,11 @@ private:
 
     int         satCache_      = kSaturationDefault;
     bool        satCacheValid_ = false;
+
+    int         hueCache_       = kSaturationDefault;
+    bool        hueCacheValid_  = false;
+    int         tempCache_      = kSaturationDefault;
+    bool        tempCacheValid_ = false;
 
     mutable bool     dirty_     = false;
     mutable uint64_t dirtyTick_ = 0;

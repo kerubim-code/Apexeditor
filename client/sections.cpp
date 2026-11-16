@@ -14,7 +14,9 @@
 #include <imgui.h>
 
 #include <windows.h>
+#include <commdlg.h>
 #include <d3d11.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
@@ -38,9 +40,9 @@ constexpr ImU32 kAccent = IM_COL32(122, 152, 255, 255);
 constexpr ImU32 kOk     = IM_COL32(96, 220, 138, 255);
 constexpr ImU32 kWarn   = IM_COL32(255, 196, 84, 255);
 
-void Dim(const char* text) {
+void Note(const char* text) {
     ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::TextWrapped("%s", text);
+    ImGui::TextUnformatted(text);
     ImGui::PopStyleColor();
 }
 
@@ -305,20 +307,6 @@ std::string PrimaryAdapterName() {
     return "unknown adapter";
 }
 
-const char* SectionLabel(Section value) {
-    switch (value) {
-        case Section::VideoCfg:     return "apex video cfg";
-        case Section::Custom:       return "Custom";
-        case Section::Color:        return "Color";
-        case Section::Optimization: return "Optimization";
-        case Section::Config:       return "Config";
-        case Section::Spotify:      return "Spotify";
-        case Section::Crosshair:    return "Crosshair";
-        case Section::Overlay:      return "Overlay";
-    }
-    return "-";
-}
-
 std::string LowerCase(std::string text) {
     for (auto& character : text)
         if (character >= 'A' && character <= 'Z')
@@ -360,69 +348,523 @@ bool IsNoiseProcess(const std::string& exe) {
     return exe == OwnExeName();
 }
 
+BOOL CALLBACK CollectWindowExecutable(HWND window, LPARAM param) {
+    auto* found = reinterpret_cast<std::vector<std::string>*>(param);
+
+    if (!IsWindowVisible(window))
+        return TRUE;
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    if ((exStyle & WS_EX_TOOLWINDOW) != 0)
+        return TRUE;
+
+    if (GetWindow(window, GW_OWNER) != nullptr && (exStyle & WS_EX_APPWINDOW) == 0)
+        return TRUE;
+
+    if (GetWindowTextLengthW(window) <= 0)
+        return TRUE;
+
+    int cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+        cloaked != 0)
+        return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == 0)
+        return TRUE;
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr)
+        return TRUE;
+
+    char  path[MAX_PATH] = {};
+    DWORD size           = MAX_PATH;
+    std::string exe;
+    if (QueryFullProcessImageNameA(process, 0, path, &size)) {
+        exe.assign(path, size);
+        const size_t slash = exe.find_last_of("\\/");
+        if (slash != std::string::npos)
+            exe = exe.substr(slash + 1);
+        exe = LowerCase(exe);
+    }
+    CloseHandle(process);
+
+    if (exe.empty() || IsNoiseProcess(exe))
+        return TRUE;
+
+    found->push_back(exe);
+    return TRUE;
+}
+
 std::vector<std::string> ScanRunningExecutables() {
     std::vector<std::string> found;
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-        return found;
-
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            char name[MAX_PATH] = {};
-            if (WideCharToMultiByte(CP_UTF8, 0, entry.szExeFile, -1, name,
-                                    MAX_PATH, nullptr, nullptr) <= 1)
-                continue;
-            std::string exe = LowerCase(name);
-            if (IsNoiseProcess(exe))
-                continue;
-            found.push_back(exe);
-        } while (Process32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
+    EnumWindows(&CollectWindowExecutable, reinterpret_cast<LPARAM>(&found));
 
     std::sort(found.begin(), found.end());
     found.erase(std::unique(found.begin(), found.end()), found.end());
     return found;
 }
 
-std::vector<std::string> ListProfiles() {
-    std::vector<std::string> files;
+struct IniEntry {
+    std::string key;
+    std::string value;
+};
 
-    WIN32_FIND_DATAA data{};
-    HANDLE handle = FindFirstFileA((settings::ConfigsDir() + "\\*.ini").c_str(), &data);
-    if (handle != INVALID_HANDLE_VALUE) {
-        do {
-            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-                files.push_back(data.cFileName);
-        } while (FindNextFileA(handle, &data));
-        FindClose(handle);
+struct IniSection {
+    std::string name;
+    std::vector<IniEntry> entries;
+};
+
+using IniDoc = std::vector<IniSection>;
+
+void Toast(Glass::Icon icon, ImU32 tile, const char* title,
+           const std::string& message);
+
+IniDoc ReadIniDoc(const std::string& path) {
+    IniDoc doc;
+
+    char names[32768] = {};
+    if (GetPrivateProfileSectionNamesA(names, sizeof(names), path.c_str()) == 0)
+        return doc;
+
+    for (const char* name = names; *name != '\0'; name += strlen(name) + 1) {
+        IniSection section;
+        section.name = name;
+
+        std::vector<char> buffer(32768, '\0');
+        GetPrivateProfileSectionA(name, buffer.data(),
+                                  static_cast<DWORD>(buffer.size()), path.c_str());
+        for (const char* line = buffer.data(); *line != '\0';
+             line += strlen(line) + 1) {
+            const char* equals = strchr(line, '=');
+            if (equals == nullptr)
+                section.entries.push_back({line, ""});
+            else
+                section.entries.push_back(
+                    {std::string(line, equals - line), std::string(equals + 1)});
+        }
+
+        if (!section.entries.empty())
+            doc.push_back(std::move(section));
     }
 
-    std::sort(files.begin(), files.end());
-    return files;
+    return doc;
 }
 
-std::string ProfileLabel(const std::string& file) {
-    const size_t dot = file.find_last_of('.');
-    return dot == std::string::npos ? file : file.substr(0, dot);
+std::string JsonEscape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char code[8];
+                    snprintf(code, sizeof(code), "\\u%04x", c);
+                    out += code;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
 }
 
-std::string SanitizeName(const char* raw) {
-    std::string name = raw != nullptr ? raw : "";
-    while (!name.empty() && (name.front() == ' ' || name.front() == '\t'))
-        name.erase(name.begin());
-    while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
-        name.pop_back();
-    for (auto& character : name)
-        if (character == '\\' || character == '/' || character == ':' ||
-            character == '*' || character == '?' || character == '"' ||
-            character == '<' || character == '>' || character == '|')
-            character = '_';
-    return name;
+std::string JsonValues(const std::vector<IniEntry>& entries) {
+    std::string out = "{\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        out += "      \"" + JsonEscape(entries[i].key) + "\": \"" +
+               JsonEscape(entries[i].value) + "\"";
+        if (i + 1 < entries.size())
+            out += ",";
+        out += "\n";
+    }
+    out += "    }";
+    return out;
+}
+
+std::string JsonDoc(const IniDoc& doc) {
+    std::string out = "{\n";
+    for (size_t i = 0; i < doc.size(); ++i) {
+        out += "    \"" + JsonEscape(doc[i].name) + "\": " +
+               JsonValues(doc[i].entries);
+        if (i + 1 < doc.size())
+            out += ",";
+        out += "\n";
+    }
+    out += "  }";
+    return out;
+}
+
+std::string BuildSettingsJson(const IniDoc& app, const IniDoc& vibrance) {
+    return "{\n"
+           "  \"format\": \"apex-settings\",\n"
+           "  \"version\": 1,\n"
+           "  \"app\": " + JsonDoc(app) + ",\n"
+           "  \"vibrance\": " + JsonDoc(vibrance) + "\n"
+           "}\n";
+}
+
+struct JsonReader {
+    const std::string& text;
+    size_t pos = 0;
+
+    void SkipSpace() {
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                ++pos;
+            else
+                break;
+        }
+    }
+
+    bool Eat(char expected) {
+        SkipSpace();
+        if (pos < text.size() && text[pos] == expected) {
+            ++pos;
+            return true;
+        }
+        return false;
+    }
+
+    bool ReadString(std::string& out) {
+        SkipSpace();
+        if (pos >= text.size() || text[pos] != '"')
+            return false;
+        ++pos;
+        out.clear();
+        while (pos < text.size()) {
+            const char c = text[pos++];
+            if (c == '"')
+                return true;
+            if (c != '\\') {
+                out.push_back(c);
+                continue;
+            }
+            if (pos >= text.size())
+                return false;
+            const char escaped = text[pos++];
+            switch (escaped) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'u': {
+                    if (pos + 4 > text.size())
+                        return false;
+                    unsigned value = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        const char digit = text[pos++];
+                        value <<= 4;
+                        if (digit >= '0' && digit <= '9')
+                            value |= static_cast<unsigned>(digit - '0');
+                        else if (digit >= 'a' && digit <= 'f')
+                            value |= static_cast<unsigned>(digit - 'a' + 10);
+                        else if (digit >= 'A' && digit <= 'F')
+                            value |= static_cast<unsigned>(digit - 'A' + 10);
+                        else
+                            return false;
+                    }
+                    if (value < 0x80) {
+                        out.push_back(static_cast<char>(value));
+                    } else if (value < 0x800) {
+                        out.push_back(static_cast<char>(0xC0 | (value >> 6)));
+                        out.push_back(static_cast<char>(0x80 | (value & 0x3F)));
+                    } else {
+                        out.push_back(static_cast<char>(0xE0 | (value >> 12)));
+                        out.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | (value & 0x3F)));
+                    }
+                    break;
+                }
+                default:
+                    out.push_back(escaped);
+                    break;
+            }
+        }
+        return false;
+    }
+
+    bool ReadScalar(std::string& out) {
+        SkipSpace();
+        const size_t start = pos;
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' ||
+                c == '\r' || c == '\n')
+                break;
+            ++pos;
+        }
+        out = text.substr(start, pos - start);
+        return !out.empty();
+    }
+
+    bool SkipValue() {
+        SkipSpace();
+        if (pos >= text.size())
+            return false;
+        if (text[pos] == '"') {
+            std::string ignored;
+            return ReadString(ignored);
+        }
+        if (text[pos] == '{') {
+            ++pos;
+            if (Eat('}'))
+                return true;
+            do {
+                std::string key;
+                if (!ReadString(key) || !Eat(':'))
+                    return false;
+                if (!SkipValue())
+                    return false;
+            } while (Eat(','));
+            return Eat('}');
+        }
+        if (text[pos] == '[') {
+            ++pos;
+            if (Eat(']'))
+                return true;
+            do {
+                if (!SkipValue())
+                    return false;
+            } while (Eat(','));
+            return Eat(']');
+        }
+        std::string ignored;
+        return ReadScalar(ignored);
+    }
+};
+
+bool ParseIniDoc(JsonReader& reader, IniDoc& doc) {
+    if (!reader.Eat('{'))
+        return false;
+    reader.SkipSpace();
+    if (reader.Eat('}'))
+        return true;
+    do {
+        IniSection section;
+        if (!reader.ReadString(section.name) || !reader.Eat(':'))
+            return false;
+        if (!reader.Eat('{'))
+            return false;
+        reader.SkipSpace();
+        if (!reader.Eat('}')) {
+            do {
+                IniEntry entry;
+                if (!reader.ReadString(entry.key) || !reader.Eat(':'))
+                    return false;
+                if (!reader.ReadString(entry.value) &&
+                    !reader.ReadScalar(entry.value))
+                    return false;
+                section.entries.push_back(std::move(entry));
+            } while (reader.Eat(','));
+            if (!reader.Eat('}'))
+                return false;
+        }
+        doc.push_back(std::move(section));
+    } while (reader.Eat(','));
+    return reader.Eat('}');
+}
+
+bool ParseSettingsJson(const std::string& text, IniDoc& app, IniDoc& vibrance) {
+    JsonReader reader{text, 0};
+    if (!reader.Eat('{'))
+        return false;
+    reader.SkipSpace();
+    if (reader.Eat('}'))
+        return false;
+    do {
+        std::string key;
+        if (!reader.ReadString(key) || !reader.Eat(':'))
+            return false;
+        if (key == "app") {
+            if (!ParseIniDoc(reader, app))
+                return false;
+        } else if (key == "vibrance") {
+            if (!ParseIniDoc(reader, vibrance))
+                return false;
+        } else if (!reader.SkipValue()) {
+            return false;
+        }
+    } while (reader.Eat(','));
+    return reader.Eat('}');
+}
+
+void WriteIniDoc(const std::string& path, const IniDoc& doc) {
+    DeleteFileA(path.c_str());
+    for (const auto& section : doc) {
+        for (const auto& entry : section.entries) {
+            WritePrivateProfileStringA(section.name.c_str(), entry.key.c_str(),
+                                       entry.value.c_str(), path.c_str());
+        }
+    }
+}
+
+bool ReadTextFile(const std::wstring& path, std::string& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    out.assign(std::istreambuf_iterator<char>(in),
+               std::istreambuf_iterator<char>());
+
+    if (out.size() >= 3 && static_cast<unsigned char>(out[0]) == 0xEF &&
+        static_cast<unsigned char>(out[1]) == 0xBB &&
+        static_cast<unsigned char>(out[2]) == 0xBF)
+        out.erase(0, 3);
+
+    return true;
+}
+
+bool WriteTextFile(const std::wstring& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return out.good();
+}
+
+std::string NarrowPath(const std::wstring& path) {
+    if (path.empty())
+        return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr,
+                                           0, nullptr, nullptr);
+    if (needed <= 1)
+        return {};
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, out.data(), needed, nullptr,
+                        nullptr);
+    return out;
+}
+
+bool ChooseJsonPath(HWND owner, bool save, std::wstring& path) {
+    wchar_t file[MAX_PATH] = L"apex-settings.json";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = owner;
+    ofn.lpstrFilter = L"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFile   = file;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrTitle  = save ? L"Export all APEX settings"
+                           : L"Import APEX settings";
+    ofn.lpstrDefExt = L"json";
+    ofn.Flags       = OFN_NOCHANGEDIR |
+                (save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST)
+                      : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST));
+
+    if (save) {
+        if (!GetSaveFileNameW(&ofn))
+            return false;
+    } else {
+        file[0] = L'\0';
+        if (!GetOpenFileNameW(&ofn))
+            return false;
+    }
+
+    path = file;
+    return true;
+}
+
+void ApplyImportedSettings() {
+    g_guiTransparency = settings::GetBool("gui_transparency", false);
+    g_showOverlayCategory = settings::GetBool("overlay_category", false);
+    g_showSpotifyCategory = settings::GetBool("spotify_category", false);
+    if (!g_showOverlayCategory)
+        settings::SetBool("overlay_on", false);
+    if (!g_showSpotifyCategory) {
+        settings::SetBool("spotify_overlay", false);
+    }
+    g_playerOverlay   = settings::GetBool("spotify_overlay", false);
+    g_playerOpacity   = static_cast<float>(std::max(
+        25, std::min(100, settings::GetInt("spotify_overlay_opacity", 85))));
+    g_playerLyrics    = settings::GetBool("spotify_lyrics", true);
+    ReapplyHotkeys();
+
+    crosshair::SetEnabled(settings::GetBool("crosshair_on", false));
+    crosshair::SetShape(settings::GetInt("crosshair_shape", 0));
+    crosshair::SetSize(settings::GetInt("crosshair_size", 10));
+    crosshair::SetThickness(settings::GetInt("crosshair_thickness", 1));
+    crosshair::ReloadGrid();
+
+    const int packed = settings::GetInt("crosshair_color", 0xFFFFFF);
+    float*    rgb    = crosshair::Rgb();
+    if (rgb != nullptr) {
+        rgb[0] = static_cast<float>((packed >> 16) & 0xFF) / 255.0f;
+        rgb[1] = static_cast<float>((packed >> 8) & 0xFF) / 255.0f;
+        rgb[2] = static_cast<float>(packed & 0xFF) / 255.0f;
+    }
+
+    overlay::Show(settings::GetBool("overlay_on", false));
+    overlay::SetClickThrough(settings::GetBool("overlay_click", false));
+    overlay::SetLocked(settings::GetBool("overlay_lock", false));
+    overlay::SetResolutionIndex(settings::GetInt("overlay_res", 0));
+
+    App& app = App::Get();
+    if ((app.section == Section::Overlay && !g_showOverlayCategory) ||
+        (app.section == Section::Spotify && !g_showSpotifyCategory))
+        app.section = Section::Misc;
+
+    auto& engine = color::VibranceEngine::Get();
+    engine.Load();
+    engine.ApplyNow();
+}
+
+void ExportSettingsJson(HWND owner) {
+    auto& engine = color::VibranceEngine::Get();
+    engine.Save();
+
+    std::wstring path;
+    if (!ChooseJsonPath(owner, true, path))
+        return;
+
+    const std::string json =
+        BuildSettingsJson(ReadIniDoc(settings::AppIniPath()),
+                          ReadIniDoc(engine.SettingsPath()));
+    if (WriteTextFile(path, json))
+        Toast(Glass::Icon::CheckCircle, kOk, "settings exported", NarrowPath(path));
+    else
+        Toast(Glass::Icon::XCircle, kWarn, "could not export the settings",
+              NarrowPath(path));
+}
+
+void ImportSettingsJson(HWND owner) {
+    std::wstring path;
+    if (!ChooseJsonPath(owner, false, path))
+        return;
+
+    std::string text;
+    if (!ReadTextFile(path, text)) {
+        Toast(Glass::Icon::XCircle, kWarn, "could not read the file",
+              NarrowPath(path));
+        return;
+    }
+
+    IniDoc app;
+    IniDoc vibrance;
+    if (!ParseSettingsJson(text, app, vibrance) ||
+        (app.empty() && vibrance.empty())) {
+        Toast(Glass::Icon::XCircle, kWarn, "not an APEX settings file",
+              NarrowPath(path));
+        return;
+    }
+
+    if (!app.empty())
+        WriteIniDoc(settings::AppIniPath(), app);
+    if (!vibrance.empty())
+        WriteIniDoc(color::VibranceEngine::Get().SettingsPath(), vibrance);
+
+    ApplyImportedSettings();
+    Toast(Glass::Icon::CheckCircle, kOk, "settings imported", NarrowPath(path));
 }
 
 void Toast(Glass::Icon icon, ImU32 tile, const char* title, const std::string& message) {
@@ -455,9 +897,123 @@ private:
     float x0_ = 0.0f, y0_ = 0.0f, x1_ = 0.0f, y1_ = 0.0f;
 };
 
+bool ModalSlider(const char* label, float* value, float vmin, float vmax,
+                 const char* fmt, float width) {
+    ImGui::PushID(label);
+
+    const float  rowH  = 30.0f;
+    const float  knobR = 7.0f;
+    const ImVec2 cur   = ImGui::GetCursorScreenPos();
+
+    ImGui::InvisibleButton("##slider", ImVec2(width, rowH));
+    const bool active  = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+
+    if (active) {
+        const float span = std::max(1.0f, width - knobR * 2.0f);
+        float       t    = (ImGui::GetIO().MousePos.x - cur.x - knobR) / span;
+        t                = std::max(0.0f, std::min(1.0f, t));
+        *value           = vmin + t * (vmax - vmin);
+    }
+
+    float t = (*value - vmin) / (vmax - vmin);
+    t       = std::max(0.0f, std::min(1.0f, t));
+
+    const float cy = cur.y + rowH * 0.5f;
+    const float x0 = cur.x + knobR;
+    const float x1 = cur.x + width - knobR;
+    const float kx = x0 + (x1 - x0) * t;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(x0, cy - 3.0f), ImVec2(x1, cy + 3.0f),
+                      IM_COL32(255, 255, 255, 26), 3.0f);
+    if (kx > x0)
+        dl->AddRectFilled(ImVec2(x0, cy - 3.0f), ImVec2(kx, cy + 3.0f),
+                          hovered || active ? IM_COL32(146, 172, 255, 235)
+                                            : IM_COL32(122, 152, 255, 205),
+                          3.0f);
+    dl->AddCircleFilled(ImVec2(kx, cy), knobR + (hovered ? 1.2f : 0.0f),
+                        IM_COL32(245, 247, 255, 255), 24);
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), fmt, *value);
+
+    const float textY  = cur.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+    const float labelX = cur.x + width + 12.0f;
+    dl->AddText(ImVec2(labelX, textY), kDim, label);
+    const float labelW = ImGui::CalcTextSize(label).x;
+    dl->AddText(ImVec2(labelX + labelW + 8.0f, textY), kInk, buf);
+
+    ImGui::PopID();
+    return active;
+}
+
+bool ModalToggle(const char* label, bool* value) {
+    ImGui::PushID(label);
+
+    const float  rowH  = 30.0f;
+    const float  w     = ImGui::GetContentRegionAvail().x;
+    const ImVec2 cur   = ImGui::GetCursorScreenPos();
+
+    ImGui::InvisibleButton("##toggle", ImVec2(w, rowH));
+    const bool clicked = ImGui::IsItemClicked();
+    const bool hovered = ImGui::IsItemHovered();
+    if (clicked)
+        *value = !*value;
+
+    const float pillW = 46.0f;
+    const float pillH = 24.0f;
+    const float py    = cur.y + (rowH - pillH) * 0.5f;
+    const float kx    = *value ? cur.x + pillW - pillH * 0.5f
+                               : cur.x + pillH * 0.5f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(cur.x, py), ImVec2(cur.x + pillW, py + pillH),
+                      *value ? IM_COL32(97, 128, 255, 240)
+                             : IM_COL32(255, 255, 255, hovered ? 34 : 24),
+                      pillH * 0.5f);
+    dl->AddCircleFilled(ImVec2(kx, py + pillH * 0.5f), pillH * 0.5f - 3.0f,
+                        IM_COL32(245, 247, 255, 255), 24);
+    dl->AddText(ImVec2(cur.x + pillW + 10.0f,
+                       cur.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f),
+                kInk, label);
+
+    ImGui::PopID();
+    return clicked;
+}
+
+bool ModalButton(const char* label, bool primary, ImVec2 size) {
+    ImGui::PushID(label);
+
+    const ImVec2 cur = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##button", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool clicked = ImGui::IsItemDeactivated() && hovered;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 fill = primary
+                           ? (hovered ? IM_COL32(128, 158, 255, 255)
+                                      : IM_COL32(104, 134, 246, 236))
+                           : IM_COL32(255, 255, 255, hovered ? 32 : 18);
+    dl->AddRectFilled(cur, ImVec2(cur.x + size.x, cur.y + size.y), fill, 12.0f);
+    if (!primary)
+        dl->AddRect(cur, ImVec2(cur.x + size.x, cur.y + size.y),
+                    IM_COL32(255, 255, 255, 42), 12.0f);
+
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(cur.x + (size.x - textSize.x) * 0.5f,
+                       cur.y + (size.y - ImGui::GetTextLineHeight()) * 0.5f),
+                IM_COL32(245, 247, 255, 255), label);
+
+    ImGui::PopID();
+    return clicked;
+}
+
 bool DrawAppProfileWindow(color::VibranceEngine& engine, const std::string& exe,
                           color::AppRule& draft, bool& loaded) {
-    static float satEdit = 150.0f;
+    static float satEdit  = 150.0f;
+    static float hueEdit  = 100.0f;
+    static float tempEdit = 100.0f;
 
     if (!loaded) {
         draft = color::AppRule{};
@@ -468,8 +1024,10 @@ bool DrawAppProfileWindow(color::VibranceEngine& engine, const std::string& exe,
                 draft = rule;
                 break;
             }
-        satEdit = static_cast<float>(draft.saturation);
-        loaded  = true;
+        satEdit  = static_cast<float>(draft.saturation);
+        hueEdit  = static_cast<float>(draft.hue);
+        tempEdit = static_cast<float>(draft.temperature);
+        loaded   = true;
     }
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -535,23 +1093,27 @@ bool DrawAppProfileWindow(color::VibranceEngine& engine, const std::string& exe,
     ImGui::PushStyleColor(ImGuiCol_Text, kInk);
     ImGui::TextUnformatted(("profile  -  " + exe).c_str());
     ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::TextWrapped("applied as soon as this window comes to the front, and only "
-                       "for this application.");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::Dummy(ImVec2(500.0f, 0.0f));
+
+    const float sliderW = std::max(160.0f, innerW - 170.0f);
 
     const float satBefore = satEdit;
-    ImGui::SetNextItemWidth(innerW - 170.0f);
-    Glass::Slider("saturation", &satEdit, 0.0f, 300.0f, "%.0f");
+    ModalSlider("saturation", &satEdit, 0.0f, 300.0f, "%.0f", sliderW);
     if (satEdit != satBefore)
         draft.saturation = static_cast<int>(satEdit + 0.5f);
-    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::TextUnformatted("100 = normal, 150 = vivid, 300 = maximum vibrance");
-    ImGui::PopStyleColor();
+
+    const float hueBefore = hueEdit;
+    ModalSlider("hue", &hueEdit, 0.0f, 300.0f, "%.0f", sliderW);
+    if (hueEdit != hueBefore)
+        draft.hue = static_cast<int>(hueEdit + 0.5f);
+
+    const float tempBefore = tempEdit;
+    ModalSlider("temperature", &tempEdit, 0.0f, 300.0f, "%.0f", sliderW);
+    if (tempEdit != tempBefore)
+        draft.temperature = static_cast<int>(tempEdit + 0.5f);
 
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    if (Glass::Toggle("use my own brightness / contrast / gamma here", &draft.levels)) {
+    if (ModalToggle("custom brightness / contrast / gamma", &draft.levels)) {
         if (draft.levels) {
             draft.brightness = engine.Brightness();
             draft.contrast   = engine.Contrast();
@@ -560,23 +1122,17 @@ bool DrawAppProfileWindow(color::VibranceEngine& engine, const std::string& exe,
     }
 
     if (draft.levels) {
-        ImGui::SetNextItemWidth(innerW - 170.0f);
-        Glass::Slider("brightness", &draft.brightness, 0.50f, 1.50f, "%.2f");
-        ImGui::SetNextItemWidth(innerW - 170.0f);
-        Glass::Slider("contrast", &draft.contrast, 0.50f, 1.50f, "%.2f");
-        ImGui::SetNextItemWidth(innerW - 170.0f);
-        Glass::Slider("gamma", &draft.gamma, 0.50f, 2.00f, "%.2f");
-        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted("1.00 = neutral on every count.");
-        ImGui::PopStyleColor();
+        ModalSlider("brightness", &draft.brightness, 0.50f, 1.50f, "%.2f", sliderW);
+        ModalSlider("contrast", &draft.contrast, 0.50f, 1.50f, "%.2f", sliderW);
+        ModalSlider("gamma", &draft.gamma, 0.50f, 2.00f, "%.2f", sliderW);
     }
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
     const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    const bool  save = Glass::Button("save profile", true, ImVec2(half, 44.0f));
+    const bool  save = ModalButton("save profile", true, ImVec2(half, 44.0f));
     ImGui::SameLine(0.0f, 12.0f);
-    if (Glass::Button("close", false, ImVec2(half, 44.0f)))
+    if (ModalButton("close", false, ImVec2(half, 44.0f)))
         close = true;
 
     ImGui::End();
@@ -635,10 +1191,6 @@ void App::DrawVideoCfg() {
     NavScrollTo(static_cast<int>(Section::VideoCfg), 0);
     Glass::BeginPanel("apex legends");
 
-    Dim("Starts the game straight from here : APEXClient runs r5apex.exe "
-        "directly when the install folder is known, and falls back to the "
-        "Steam protocol when it is not.");
-
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
     if (!GameFound())
@@ -660,7 +1212,7 @@ void App::DrawVideoCfg() {
 
     if (!GameFound()) {
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        Dim("Apex Legends was not found on this PC - install it on Steam first.");
+        Note("Apex Legends not found.");
     }
 
     InfoRow("game folder", GameFound() ? GameDirFound().c_str()
@@ -670,11 +1222,7 @@ void App::DrawVideoCfg() {
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     NavScrollTo(static_cast<int>(Section::VideoCfg), 1);
-    Glass::BeginPanel("apex video cfg  -  download and install");
-
-    Dim("Grabs the kerubimm files from the public APEX-SETTINGS repository and "
-        "drops them exactly where Apex Legends reads them. Everything happens "
-        "on this PC : no key, no account, no launcher.");
+    Glass::BeginPanel("apex video cfg");
 
     InfoRow("repository", "kerubim-code / APEX-SETTINGS");
     InfoRow("game folder", SavedGamesDir().c_str());
@@ -731,24 +1279,14 @@ void App::DrawVideoCfg() {
         parent.Restore();
     }
 
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    Dim("videoconfig.txt, voice_volumes.dat and steam_autocloud.vdf are the three "
-        "files installed here - keybinds and profile.cfg are never touched. "
-        "autoexec.cfg lives inside the Steam folder, so it has its own button in "
-        "the Optimization section. To change resolution, FOV, textures or "
-        "anti-aliasing by hand, use the Custom section.");
-
     Glass::EndPanel();
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::VideoCfg), 2);
-    Glass::BeginPanel("where the files land");
+    Glass::BeginPanel("files");
 
     InfoRow("video settings", LocalDir().c_str());
     InfoRow("profile", ProfileDir().c_str());
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    Dim("Apex reads these folders every time it starts, so launch the game once "
-        "after installing to pick the new settings up.");
 
     Glass::EndPanel();
 }
@@ -839,6 +1377,50 @@ const char* FovScaleFor(int fov) {
 
 constexpr int kFovPresets[] = {70, 90, 100, 110, 120};
 
+float FovToScale(float fov) {
+    if (fov <= static_cast<float>(kFovPresets[0]))
+        return 1.0f;
+    for (size_t i = 1; i < sizeof(kFovPresets) / sizeof(kFovPresets[0]); ++i) {
+        const float hi = static_cast<float>(kFovPresets[i]);
+        if (fov <= hi) {
+            const float lo    = static_cast<float>(kFovPresets[i - 1]);
+            const float loS   = static_cast<float>(atof(FovScaleFor(kFovPresets[i - 1])));
+            const float hiS   = static_cast<float>(atof(FovScaleFor(kFovPresets[i])));
+            const float ratio = (fov - lo) / (hi - lo);
+            return loS + (hiS - loS) * ratio;
+        }
+    }
+    return 1.7f;
+}
+
+std::string FormatScale(float scale) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.3f", scale);
+    std::string out = buf;
+    while (!out.empty() && out.back() == '0')
+        out.pop_back();
+    if (!out.empty() && out.back() == '.')
+        out.pop_back();
+    return out;
+}
+
+float ScaleToFov(float scale) {
+    if (scale <= 1.0f)
+        return 70.0f;
+    for (size_t i = 1; i < sizeof(kFovPresets) / sizeof(kFovPresets[0]); ++i) {
+        const float hiS = static_cast<float>(atof(FovScaleFor(kFovPresets[i])));
+        if (scale <= hiS) {
+            const float loS   = static_cast<float>(atof(FovScaleFor(kFovPresets[i - 1])));
+            const float ratio = (scale - loS) / (hiS - loS);
+            return static_cast<float>(kFovPresets[i - 1]) +
+                   (static_cast<float>(kFovPresets[i]) -
+                    static_cast<float>(kFovPresets[i - 1])) *
+                       ratio;
+        }
+    }
+    return 120.0f;
+}
+
 bool ChipRow(const std::vector<std::pair<std::string, bool>>& chips,
              std::vector<int>* clicked) {
     const float avail = ImGui::GetContentRegionAvail().x;
@@ -879,6 +1461,7 @@ void App::DrawCustom() {
     const std::string resH      = VideoCfgGet(videoText, "setting.defaultresheight");
     const std::string streamMem = VideoCfgGet(videoText, "setting.stream_memory");
     const std::string aa        = VideoCfgGet(videoText, "setting.mat_antialias_mode");
+    const std::string gam       = VideoCfgGet(videoText, "setting.gamma");
     const std::string fovScale  = ProfileFovGet(profileText);
 
     auto writeVideoKey = [&](const char* key, const char* value,
@@ -941,22 +1524,14 @@ void App::DrawCustom() {
                              aa == "12"};
     StatTileRow(fontSemi, labels, values, accents, 4);
 
-    Dim("These are the two Apex config files, edited in place on this PC. "
-        "Close the game first : Apex rewrites both files when it quits and "
-        "would undo whatever is changed here.");
-
     if (!haveVideo) {
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        Dim("videoconfig.txt was not found - install Apex Legends and the "
-            "settings first from the apex video cfg section.");
+        Note("videoconfig.txt not found.");
     }
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::Custom), 0);
-    Glass::BeginPanel("resolution  -  setting.defaultres");
-
-    Dim("Standard 16:9 modes plus the two stretched ones used in "
-        "competitive play, then a custom field for anything else.");
+    Glass::BeginPanel("resolution");
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
@@ -1029,9 +1604,22 @@ void App::DrawCustom() {
             if (VideoCfgSet(next, "setting.defaultres", ws) &&
                 VideoCfgSet(next, "setting.defaultresheight", hs) &&
                 WriteTextFile(videoPath, next)) {
-                Toast(Glass::Icon::CheckCircle, kOk, "resolution applied",
-                      std::string(ws) + " x " + hs +
-                      " written to videoconfig.txt");
+                const auto  launch = videocfg::EnsureLaunchOptions();
+                std::string message = std::string(ws) + " x " + hs;
+                if (launch.ok) {
+                    if (launch.changed)
+                        message += "  +  launch options updated";
+                    else if (launch.alreadyPresent)
+                        message += "  +  launch options already set";
+                    Toast(Glass::Icon::CheckCircle, kOk, "resolution applied",
+                          message);
+                } else {
+                    message += "  +  ";
+                    message += launch.detail.empty() ? "launch options not updated"
+                                                     : launch.detail;
+                    Toast(Glass::Icon::XCircle, kWarn, "resolution applied",
+                          message);
+                }
             } else {
                 Toast(Glass::Icon::XCircle, kWarn, "could not write", videoPath);
             }
@@ -1046,11 +1634,7 @@ void App::DrawCustom() {
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::Custom), 1);
-    Glass::BeginPanel("field of view  -  cl_fovScale  (profile.cfg)");
-
-    Dim("Apex stores the FOV as cl_fovScale in profile.cfg : 110 is 1.5, "
-        "120 is 1.7 and 120 is the maximum. The file is created here if "
-        "Apex never wrote one.");
+    Glass::BeginPanel("field of view");
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
@@ -1074,6 +1658,41 @@ void App::DrawCustom() {
         }
     }
 
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    Glass::SectionHeader("exact value");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    static char fovField[16] = "";
+    static bool fovSeeded    = false;
+    if (!fovSeeded) {
+        const float current =
+            fovScale.empty() ? 70.0f
+                             : ScaleToFov(static_cast<float>(atof(fovScale.c_str())));
+        snprintf(fovField, sizeof(fovField), "%.0f", current);
+        fovSeeded = true;
+    }
+
+    Glass::TextField("fov", fovField, sizeof(fovField), "70 - 120");
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    if (Glass::Button("apply fov", true,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
+        const float fov = static_cast<float>(atof(fovField));
+        if (fov < 70.0f || fov > 120.0f) {
+            Toast(Glass::Icon::XCircle, kWarn, "invalid fov",
+                  "fov must be between 70 and 120.");
+        } else {
+            const std::string scale = FormatScale(FovToScale(fov));
+            if (ProfileFovSet(profilePath, scale)) {
+                Toast(Glass::Icon::CheckCircle, kOk, "field of view applied",
+                      "fov " + std::string(fovField) +
+                          " written as cl_fovScale \"" + scale + "\"");
+            } else {
+                Toast(Glass::Icon::XCircle, kWarn, "could not write",
+                      profilePath);
+            }
+        }
+    }
+
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     InfoRow("cl_fovScale", fovScale.empty() ? "not set (game default)"
                                              : fovScale.c_str());
@@ -1082,11 +1701,7 @@ void App::DrawCustom() {
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::Custom), 2);
-    Glass::BeginPanel("texture quality  -  setting.stream_memory");
-
-    Dim("stream_memory is the texture budget in kilobytes : 0 is the low "
-        "preset, 300000 the high one - Apex only knows these two, there is "
-        "no free number here.");
+    Glass::BeginPanel("texture quality");
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
@@ -1104,6 +1719,38 @@ void App::DrawCustom() {
     if (!haveVideo)
         ImGui::EndDisabled();
 
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    Glass::SectionHeader("exact value");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    static char streamField[24] = "";
+    static bool streamSeeded    = false;
+    if (!streamSeeded && !streamMem.empty()) {
+        snprintf(streamField, sizeof(streamField), "%s", streamMem.c_str());
+        streamSeeded = true;
+    }
+
+    if (!haveVideo)
+        ImGui::BeginDisabled();
+    Glass::TextField("stream memory", streamField, sizeof(streamField),
+                     "e.g. 300000");
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    if (Glass::Button("apply texture value", true,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
+        const long value = atol(streamField);
+        if (value < 0 || value > 2000000) {
+            Toast(Glass::Icon::XCircle, kWarn, "invalid value",
+                  "stream memory must be between 0 and 2000000.");
+        } else {
+            char normalized[24];
+            snprintf(normalized, sizeof(normalized), "%ld", value);
+            writeVideoKey("setting.stream_memory", normalized,
+                          "texture quality applied");
+        }
+    }
+    if (!haveVideo)
+        ImGui::EndDisabled();
+
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     InfoRow("current value", streamMem.empty() ? "not found"
                                                : streamMem.c_str());
@@ -1111,10 +1758,7 @@ void App::DrawCustom() {
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::Custom), 3);
-    Glass::BeginPanel("anti-aliasing  -  setting.mat_antialias_mode");
-
-    Dim("mat_antialias_mode is 12 when anti-aliasing is on and 0 when it "
-        "is off - the toggle only ever writes one of those two values.");
+    Glass::BeginPanel("anti-aliasing");
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
@@ -1129,6 +1773,53 @@ void App::DrawCustom() {
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     InfoRow("current value", aa.empty() ? "not found" : aa.c_str());
+    Glass::EndPanel();
+
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    NavScrollTo(static_cast<int>(Section::Custom), 4);
+    Glass::BeginPanel("gamma");
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    static char gammaField[24] = "";
+    static bool gammaSeeded    = false;
+    if (!gammaSeeded) {
+        snprintf(gammaField, sizeof(gammaField), "%s",
+                 gam.empty() ? "1" : gam.c_str());
+        gammaSeeded = true;
+    }
+
+    if (!haveVideo)
+        ImGui::BeginDisabled();
+    Glass::TextField("setting.gamma", gammaField, sizeof(gammaField),
+                     "base is 1");
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    if (Glass::Button("apply gamma", true,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
+        char* end = nullptr;
+        const double value = strtod(gammaField, &end);
+        if (end == gammaField || value < 0.05 || value > 10.0) {
+            Toast(Glass::Icon::XCircle, kWarn, "invalid gamma",
+                  "gamma must be between 0.05 and 10.");
+        } else {
+            char text[32];
+            snprintf(text, sizeof(text), "%.6f", value);
+            std::string normalized = text;
+            while (!normalized.empty() && normalized.back() == '0')
+                normalized.pop_back();
+            if (!normalized.empty() && normalized.back() == '.')
+                normalized.pop_back();
+            writeVideoKey("setting.gamma", normalized.c_str(),
+                          "gamma applied");
+        }
+    }
+    if (!haveVideo)
+        ImGui::EndDisabled();
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    InfoRow("current value", gam.empty() ? "not found" : gam.c_str());
+    InfoRow("videoconfig.txt", videoPath.c_str());
     Glass::EndPanel();
 }
 
@@ -1161,9 +1852,7 @@ void App::DrawColor() {
 
     {
         const std::string detail =
-            engine.Running()
-                ? engine.BackendInfo()
-                : "the engine is not running - start it from the Config section.";
+            engine.Running() ? engine.BackendInfo() : "engine stopped";
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
         ImGui::TextWrapped("%s", detail.c_str());
         ImGui::PopStyleColor();
@@ -1171,17 +1860,15 @@ void App::DrawColor() {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
     NavScrollTo(static_cast<int>(Section::Color), 0);
-    Glass::BeginPanel("screen profile  -  desktop level");
+    Glass::BeginPanel("screen profile");
 
     bool enabled = engine.Enabled();
     if (Glass::Toggle("enable colour engine", &enabled))
         engine.SetEnabled(enabled);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
-    if (!enabled) {
-        Dim("The engine is off: the screen is back to the driver defaults. Turn it on to "
-            "use the sliders below.");
-    } else {
+    if (enabled) {
+        ImGui::PushID("screen_profile");
 
         float saturation = static_cast<float>(engine.DesktopSaturation());
         const float satBefore = saturation;
@@ -1189,7 +1876,21 @@ void App::DrawColor() {
         Glass::Slider("saturation", &saturation, 0.0f, 300.0f, "%.0f");
         if (saturation != satBefore)
             engine.SetDesktopSaturation(static_cast<int>(saturation + 0.5f));
-        Dim("100 = normal, 150 = vivid, 300 = maximum vibrance");
+
+        float hue = static_cast<float>(engine.Hue());
+        const float hueBefore = hue;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        Glass::Slider("hue", &hue, 0.0f, 300.0f, "%.0f");
+        if (hue != hueBefore)
+            engine.SetHue(static_cast<int>(hue + 0.5f));
+
+        float temperature = static_cast<float>(engine.Temperature());
+        const float tempBefore = temperature;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        Glass::Slider("temperature", &temperature, 0.0f, 300.0f, "%.0f");
+        if (temperature != tempBefore)
+            engine.SetTemperature(static_cast<int>(temperature + 0.5f));
+
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
         float brightness = engine.Brightness();
@@ -1217,18 +1918,18 @@ void App::DrawColor() {
             engine.SetBrightness(1.0f);
             engine.SetContrast(1.0f);
             engine.SetGamma(1.0f);
+            engine.SetHue(color::VibranceEngine::kSaturationDefault);
+            engine.SetTemperature(color::VibranceEngine::kSaturationDefault);
             engine.SetDesktopSaturation(color::VibranceEngine::kSaturationDefault);
         }
 
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        Dim("Saturation goes through the AMD driver (ADL). Brightness, contrast and "
-            "gamma use the Windows gamma ramp on every active display.");
+        ImGui::PopID();
     }
 
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Color), 1);
-    Glass::BeginPanel("running software  -  detect and colour");
+    Glass::BeginPanel("running software");
 
     static std::vector<std::string> running;
     static uint64_t                 scannedAt = 0;
@@ -1244,8 +1945,10 @@ void App::DrawColor() {
     InfoRow("in front", frontApp.empty() ? "-" : frontApp.c_str());
 
     static float processSat = 150.0f;
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 52.0f);
-    Glass::Slider("saturation to apply", &processSat, 0.0f, 300.0f, "%.0f");
+    ImGui::PushID("process_saturation");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+    Glass::Slider("saturation", &processSat, 0.0f, 300.0f, "%.0f");
+    ImGui::PopID();
     ImGui::SameLine(0.0f, 8.0f);
     if (Glass::IconButton("scan", Glass::Icon::Refresh, 34.0f)) {
         running   = ScanRunningExecutables();
@@ -1289,10 +1992,15 @@ void App::DrawColor() {
 
         ImGui::PushID(exe.c_str());
 
-        const float  w    = ImGui::GetContentRegionAvail().x;
+        const float  w    = ImGui::GetContentRegionAvail().x - 10.0f;
         const float  rowH = 32.0f;
         const ImVec2 p    = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(w, rowH));
+
+        const ImVec2 childPos  = ImGui::GetWindowPos();
+        const ImVec2 childSize = ImGui::GetWindowSize();
+        const bool   rowInside = p.y >= childPos.y &&
+                                 p.y + rowH <= childPos.y + childSize.y;
 
         ImDrawList* dl     = ImGui::GetWindowDrawList();
         const float textY  = p.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
@@ -1314,19 +2022,23 @@ void App::DrawColor() {
             const ImVec2 ts = ImGui::CalcTextSize(tag);
             dl->AddText(ImVec2(profX - 10.0f - ts.x, textY), kOk, tag);
 
-            ImGui::SetCursorScreenPos(ImVec2(btnX, btnY));
-            if (Glass::IconButton("unrule", Glass::Icon::Minus, 30.0f))
-                dropExe = exe;
-        } else {
+            if (rowInside) {
+                ImGui::SetCursorScreenPos(ImVec2(btnX, btnY));
+                if (Glass::IconButton("unrule", Glass::Icon::Minus, 30.0f))
+                    dropExe = exe;
+            }
+        } else if (rowInside) {
             ImGui::SetCursorScreenPos(ImVec2(btnX, btnY));
             if (Glass::IconButton("ruleit", Glass::Icon::Plus, 30.0f))
                 addExe = exe;
         }
 
-        ImGui::SetCursorScreenPos(ImVec2(profX, btnY));
-        if (Glass::IconButton("profile", Glass::Icon::Sliders, 30.0f)) {
-            profileExe    = exe;
-            profileLoaded = false;
+        if (rowInside) {
+            ImGui::SetCursorScreenPos(ImVec2(profX, btnY));
+            if (Glass::IconButton("profile", Glass::Icon::Sliders, 30.0f)) {
+                profileExe    = exe;
+                profileLoaded = false;
+            }
         }
 
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 4.0f));
@@ -1371,15 +2083,10 @@ void App::DrawColor() {
             profileExe.clear();
     }
 
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    Dim("Press + to give an application its own saturation : it is applied as soon as "
-        "that window comes to the front. The list refreshes by itself every few "
-        "seconds.");
-
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Color), 2);
-    Glass::BeginPanel("per application  -  saturation rules");
+    Glass::BeginPanel("per application rules");
 
     std::vector<color::AppRule> rules = engine.Rules();
     const std::string&          foreground = frontApp;
@@ -1388,7 +2095,7 @@ void App::DrawColor() {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
     if (rules.empty()) {
-        Dim("No rule yet. Every window uses the desktop saturation value.");
+        Note("no rule yet");
         ImGui::Dummy(ImVec2(0.0f, 4.0f));
     }
 
@@ -1461,10 +2168,6 @@ void App::DrawColor() {
         }
     }
 
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    Dim("When the matching window comes to the front, its saturation is applied "
-        "automatically and restored when it loses focus.");
-
     Glass::EndPanel();
 }
 
@@ -1510,12 +2213,7 @@ void App::DrawOptimization() {
         snprintf(execState, sizeof(execState), "%s",
                  execOnDisk ? "installed" : "not installed");
 
-    Glass::BeginPanel("autoexec.cfg  -  kerubimm optimisation file");
-
-    Dim("autoexec.cfg comes from the same GitHub repository as the video "
-        "settings, but it lands inside the Steam game folder (\\cfg) - so it "
-        "needs an administrator instance of APEXClient. Nothing else in this "
-        "section touches your files.");
+    Glass::BeginPanel("autoexec.cfg");
 
     InfoRow("repository", "kerubim-code / APEX-SETTINGS / autoexec.cfg");
     InfoRow("target", videocfg::SteamFound() ? videocfg::SteamCfgDir().c_str()
@@ -1536,8 +2234,24 @@ void App::DrawOptimization() {
                              46.0f));
     if (!canInstall)
         ImGui::EndDisabled();
-    if (execPressed)
+    if (execPressed) {
         videocfg::StartAutoexec();
+
+        const auto launch = videocfg::EnsureAutoexecLaunchOption();
+        if (launch.ok) {
+            if (launch.changed) {
+                Toast(Glass::Icon::CheckCircle, kOk, "launch option added",
+                      "+exec autoexec.cfg");
+            } else {
+                Toast(Glass::Icon::CheckCircle, kOk, "launch option already set",
+                      "+exec autoexec.cfg");
+            }
+        } else {
+            Toast(Glass::Icon::XCircle, kWarn, "launch option not updated",
+                  launch.detail.empty() ? "steam localconfig not found"
+                                        : launch.detail);
+        }
+    }
 
     if (needAdmin) {
         ImGui::SameLine(0.0f, 12.0f);
@@ -1605,177 +2319,40 @@ void App::DrawOptimization() {
     }
 
     Glass::EndPanel();
-
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-
-    Glass::BeginPanel("tuning  -  module coming soon");
-    Dim("This module will host the system optimisations (priority tweaks, service "
-        "profiles, game mode, ...). The layout is ready, the controls will be added in "
-        "the next build.");
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-
-    const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    ImGui::BeginDisabled();
-    Glass::Button("performance profile", false, ImVec2(half, 44.0f));
-    ImGui::SameLine(0.0f, 12.0f);
-    Glass::Button("apply", false, ImVec2(half, 44.0f));
-    ImGui::EndDisabled();
-
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    Dim("Disabled until the module is implemented.");
-    Glass::EndPanel();
 }
 
 void App::DrawConfig() {
     auto& engine = color::VibranceEngine::Get();
 
-    const std::vector<std::string> profiles = ListProfiles();
-
-    char profileCount[32];
-    snprintf(profileCount, sizeof(profileCount), "%d",
-             static_cast<int>(profiles.size()));
-
-    char engineState[16];
-    snprintf(engineState, sizeof(engineState), "%s", engine.Running() ? "on" : "off");
-
-    char bootState[16];
-    snprintf(bootState, sizeof(bootState), "%s",
-             settings::GetBool("boot_animation", true) ? "on" : "off");
-
-    const char* labels[4] = {"saved profiles", "colour engine", "boot animation",
-                             "current section"};
-    const char* values[4] = {profileCount, engineState, bootState,
-                             SectionLabel(section)};
-    const bool  accents[4] = {true, engine.Running(), true, false};
-    StatTileRow(fontSemi, labels, values, accents, 4);
-
     NavScrollTo(static_cast<int>(Section::Config), 0);
-    Glass::BeginPanel("profiles  -  save and load");
+    Glass::BeginPanel("settings");
 
-    InfoRow("settings file", engine.SettingsPath().c_str());
-    InfoRow("profile folder", settings::ConfigsDir().c_str());
+    InfoRow("app settings", settings::AppIniPath().c_str());
+    InfoRow("colour settings", engine.SettingsPath().c_str());
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
-    Glass::Divider();
-    Glass::SectionHeader("save the current settings as");
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
 
-    static char nameField[64] = "";
-    Glass::TextField("profilename", nameField, sizeof(nameField),
-                     "profile name  (e.g. gaming)", Glass::Icon::File);
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-
-    const std::string wanted = SanitizeName(nameField);
-    if (wanted.empty())
-        ImGui::BeginDisabled();
-    const bool savePressed =
-        Glass::Button("save profile", true, ImVec2(190.0f, 44.0f));
-    if (wanted.empty())
-        ImGui::EndDisabled();
-
-    ImGui::SameLine(0.0f, 10.0f);
-    const bool flushPressed =
-        Glass::Button("write settings now", false, ImVec2(200.0f, 44.0f));
-
-    if (savePressed && !wanted.empty()) {
-        engine.Save();
-        const std::string target = settings::ConfigsDir() + "\\" + wanted + ".ini";
-        if (CopyFileA(engine.SettingsPath().c_str(), target.c_str(), FALSE)) {
-            nameField[0] = '\0';
-            Toast(Glass::Icon::CheckCircle, kOk, "profile saved", wanted);
-        } else {
-            Toast(Glass::Icon::XCircle, kWarn, "could not save the profile", wanted);
-        }
-    }
-
-    if (flushPressed) {
-        engine.Save();
-        Toast(Glass::Icon::CheckCircle, kOk, "settings written", engine.SettingsPath());
-    }
+    if (Glass::Button("export all settings", true, ImVec2(half, 44.0f)))
+        ExportSettingsJson(Window());
+    ImGui::SameLine(0.0f, 12.0f);
+    if (Glass::Button("import settings", false, ImVec2(half, 44.0f)))
+        ImportSettingsJson(Window());
 
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    Glass::SectionHeader("saved profiles");
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
-    if (profiles.empty())
-        Dim("No profile yet. Name the current settings above and press save profile.");
-
-    std::string loadFile;
-    std::string deleteFile;
-
-    for (size_t i = 0; i < profiles.size(); ++i) {
-        ImGui::PushID(static_cast<int>(i));
-
-        const std::string label = ProfileLabel(profiles[i]);
-        const float       w     = ImGui::GetContentRegionAvail().x;
-        const float       rowH  = 46.0f;
-        const ImVec2      p     = ImGui::GetCursorScreenPos();
-        ImGui::Dummy(ImVec2(w, rowH));
-
-        const float tileH   = rowH - 8.0f;
-        const float lineH   = ImGui::GetTextLineHeight();
-
-        Glass::Primitive tile;
-        tile.cx            = p.x + w * 0.5f;
-        tile.cy            = p.y + tileH * 0.5f;
-        tile.hw            = w * 0.5f;
-        tile.hh            = tileH * 0.5f;
-        tile.corner_radius = 10.0f;
-        tile.fade          = 1.0f;
-        tile.material      = Glass::Material::Thin;
-        if (Glass::g != nullptr)
-            Glass::g->Submit(tile);
-
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2(p.x + 14.0f, p.y + (tileH - lineH) * 0.5f), kInk, label.c_str());
-
-        ImGui::SetCursorScreenPos(
-            ImVec2(p.x + w - 190.0f, p.y + (tileH - 34.0f) * 0.5f));
-        const bool loadPressed = Glass::Button("load", false, ImVec2(92.0f, 34.0f));
-
-        ImGui::SetCursorScreenPos(
-            ImVec2(p.x + w - 46.0f, p.y + (tileH - 34.0f) * 0.5f));
-        const bool removePressed = Glass::IconButton("del", Glass::Icon::Trash, 34.0f);
-
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 4.0f));
-
-        ImGui::Dummy(ImVec2(w, 0.0f));
-
-        if (loadPressed)
-            loadFile = profiles[i];
-        if (removePressed)
-            deleteFile = profiles[i];
-
-        ImGui::PopID();
-    }
-
-    if (!loadFile.empty()) {
-        const std::string source = settings::ConfigsDir() + "\\" + loadFile;
-        if (CopyFileA(source.c_str(), engine.SettingsPath().c_str(), FALSE) &&
-            engine.Load()) {
-            engine.ApplyNow();
-            Toast(Glass::Icon::CheckCircle, kOk, "profile loaded",
-                  ProfileLabel(loadFile));
-        } else {
-            Toast(Glass::Icon::XCircle, kWarn, "could not load the profile",
-                  ProfileLabel(loadFile));
-        }
-    }
-
-    if (!deleteFile.empty()) {
-        const std::string target = settings::ConfigsDir() + "\\" + deleteFile;
-        if (DeleteFileA(target.c_str()))
-            Toast(Glass::Icon::XCircle, kWarn, "profile deleted",
-                  ProfileLabel(deleteFile));
-        else
-            Toast(Glass::Icon::XCircle, kWarn, "could not delete the profile",
-                  ProfileLabel(deleteFile));
+    if (Glass::Button("save everything now", false,
+                      ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
+        engine.Save();
+        Toast(Glass::Icon::CheckCircle, kOk, "saved",
+              settings::AppIniPath() + " + " + engine.SettingsPath());
     }
 
     Glass::EndPanel();
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     NavScrollTo(static_cast<int>(Section::Config), 1);
-    Glass::BeginPanel("application  -  startup behaviour");
+    Glass::BeginPanel("startup");
 
     bool option = settings::GetBool("start_engine", true);
     if (Glass::Toggle("start the colour engine at launch", &option))
@@ -1793,8 +2370,6 @@ void App::DrawConfig() {
         if (option)
             settings::SetInt("section", static_cast<int>(section));
     }
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    Dim("These options are applied the next time APEX starts.");
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     const float engineW = ImGui::GetContentRegionAvail().x;
@@ -1809,74 +2384,59 @@ void App::DrawConfig() {
     }
 
     Glass::EndPanel();
+}
 
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    NavScrollTo(static_cast<int>(Section::Config), 2);
-    Glass::BeginPanel("branding  -  logo artwork");
+void App::DrawMisc() {
+    NavScrollTo(static_cast<int>(Section::Misc), 0);
+    Glass::BeginPanel("interface");
 
-    char    exePath[MAX_PATH] = {};
-    const DWORD exeLength     = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    std::string logoFile      = "logo.jpg";
-    if (exeLength > 0 && exeLength < MAX_PATH) {
-        const std::string path(exePath, exeLength);
-        const size_t      slash = path.find_last_of("\\/");
-        if (slash != std::string::npos)
-            logoFile = path.substr(0, slash + 1) + "logo.jpg";
+    bool transparency = g_guiTransparency;
+    if (Glass::Toggle("transparent gui", &transparency)) {
+        g_guiTransparency = transparency;
+        settings::SetBool("gui_transparency", transparency);
+        Toast(Glass::Icon::CheckCircle, kOk,
+              transparency ? "gui transparency on" : "clean black background",
+              transparency ? "desktop blur" : "black glass");
     }
-
-    InfoRow("artwork file", logoFile.c_str());
-    InfoRow("state", !logo::Ready()        ? "not found"
-                     : logo::FromDisk()    ? "loaded from logo.jpg"
-                                           : "loaded (built into the exe)");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    Dim("The artwork ships inside APEXClient.exe, so the program is fully "
-        "portable and needs no files next to it. To use your own picture, "
-        "drop any jpeg or png beside the exe, rename it logo.jpg and "
-        "restart APEX - it replaces the built-in one for the boot screen, "
-        "the sidebar badge and the footer avatar.");
-    if (!logo::Ready())
-        Dim("No artwork is available, so the vector emblem is shown instead.");
 
     Glass::EndPanel();
 
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    NavScrollTo(static_cast<int>(Section::Config), 3);
-    Glass::BeginPanel("maintenance  -  files and data");
-
-    const float half = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-
-    if (Glass::Button("reload settings from disk", false, ImVec2(half, 44.0f))) {
-        engine.Load();
-        engine.ApplyNow();
-        Toast(Glass::Icon::CheckCircle, kOk, "reloaded", engine.SettingsPath());
-    }
-    ImGui::SameLine(0.0f, 12.0f);
-    if (Glass::Button("open the settings folder", false, ImVec2(half, 44.0f)))
-        ShellExecuteA(nullptr, "open", settings::RootDir().c_str(), nullptr, nullptr,
-                      SW_SHOWNORMAL);
-
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    Glass::BeginPanel("categories");
 
-    if (Glass::Button("save everything now", false, ImVec2(half, 44.0f))) {
-        engine.Save();
-        Toast(Glass::Icon::CheckCircle, kOk, "saved", engine.SettingsPath());
+    bool overlayCategory = g_showOverlayCategory;
+    if (Glass::Toggle("overlay category", &overlayCategory)) {
+        g_showOverlayCategory = overlayCategory;
+        settings::SetBool("overlay_category", overlayCategory);
+        if (!overlayCategory) {
+            overlay::Show(false);
+            if (section == Section::Overlay) {
+                section = Section::Misc;
+                if (settings::GetBool("remember_section", true))
+                    settings::SetInt("section", static_cast<int>(section));
+            }
+        }
+        Toast(Glass::Icon::CheckCircle, kOk, "overlay",
+              overlayCategory ? "category shown" : "category hidden");
     }
-    ImGui::SameLine(0.0f, 12.0f);
-    if (Glass::Button("reset to factory defaults", false, ImVec2(half, 44.0f))) {
-        engine.SetEnabled(true);
-        engine.SetDesktopSaturation(color::VibranceEngine::kSaturationDefault);
-        engine.SetBrightness(1.0f);
-        engine.SetContrast(1.0f);
-        engine.SetGamma(1.0f);
-        engine.SetRules({});
-        engine.Save();
-        Toast(Glass::Icon::CheckCircle, kOk, "reset done",
-              "saturation, brightness, contrast and gamma are back to normal");
-    }
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    Dim("Everything lives in %LOCALAPPDATA%\\APEX : vibrance.ini holds the colour "
-        "settings, app.ini the startup options, configs\\ your saved profiles.");
+    bool spotifyCategory = g_showSpotifyCategory;
+    if (Glass::Toggle("spotify category", &spotifyCategory)) {
+        g_showSpotifyCategory = spotifyCategory;
+        settings::SetBool("spotify_category", spotifyCategory);
+        if (!spotifyCategory) {
+            g_playerOverlay = false;
+            settings::SetBool("spotify_overlay", false);
+            if (section == Section::Spotify) {
+                section = Section::Misc;
+                if (settings::GetBool("remember_section", true))
+                    settings::SetInt("section", static_cast<int>(section));
+            }
+        }
+        Toast(Glass::Icon::CheckCircle, kOk, "spotify",
+              spotifyCategory ? "category shown" : "category hidden");
+    }
 
     Glass::EndPanel();
 }
@@ -2012,10 +2572,7 @@ void App::DrawSpotify() {
     Glass::BeginPanel("now playing");
 
     if (!np.available) {
-        Dim("No media session is publishing right now. Start a track in "
-            "Spotify (or any player that speaks the Windows media controls) "
-            "and it shows up here instantly - APEX never touches the player "
-            "itself.");
+        Note("no media session");
     } else {
         const float  avail = ImGui::GetContentRegionAvail().x;
         const float  art   = 148.0f;
@@ -2119,12 +2676,6 @@ void App::DrawSpotify() {
         g_playerLyrics = lyrics;
         settings::SetBool("spotify_lyrics", lyrics);
     }
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    Dim("The overlay is a small always-on-top glass window with the cover, "
-        "title, position and transport buttons. Drag it anywhere; it never "
-        "takes focus away from your game, and the opacity slider controls "
-        "the whole card.");
-
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Spotify), 2);
@@ -2168,10 +2719,6 @@ void App::DrawSpotify() {
             recSlot = -1;
         }
     }
-
-    Dim("Click a button, then press the key you want. The keys are global : "
-        "they fire even inside a game. Right-click clears a binding, Esc "
-        "cancels while recording.");
 
     static const char* kBindName[3] = {"play / pause", "previous track",
                                        "next track"};
@@ -2222,16 +2769,15 @@ void App::DrawSpotify() {
     Glass::BeginPanel("lyrics");
 
     if (!g_playerLyrics) {
-        Dim("Lyrics are switched off. Turn the toggle above back on to see "
-            "the synchronised lines here and on the overlay.");
+        Note("lyrics off");
     } else if (!np.available) {
-        Dim("Start a track and the lyrics for it appear here.");
+        Note("start a track");
     } else if (lyrStatus == "loading") {
-        Dim("Looking the lyrics up on lrclib.net ...");
+        Note("loading lyrics ...");
     } else if (lyrStatus == "none") {
-        Dim("No lyrics found for this track on lrclib.net.");
+        Note("no lyrics found");
     } else if (lines.empty()) {
-        Dim("No lyrics available.");
+        Note("no lyrics available");
     } else {
         int idx = ActiveLyricIndex(lines, np.posMs);
         const int count = static_cast<int>(lines.size());
@@ -2257,13 +2803,8 @@ void App::DrawSpotify() {
             ImGui::Dummy(ImVec2(0.0f, 2.0f));
         }
         if (idx < 0)
-            Dim("waiting for the first line ...");
+            Note("waiting for the first line ...");
     }
-
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    Dim("Lyrics come from lrclib.net : one plain request per track, no key, "
-        "no account. Without network the panel simply stays empty - nothing "
-        "else in APEX ever connects.");
 
     Glass::EndPanel();
 }
@@ -2413,8 +2954,8 @@ void App::DrawSpotifyOverlay(float width, float height) {
 }
 
 void App::DrawCrosshair() {
-    static const char* kShapes[5] = {"cross", "circle", "point", "square",
-                                     "diamond"};
+    static const char* kShapes[6] = {"cross", "circle", "point", "square",
+                                     "diamond", "custom"};
 
     char state[16];
     snprintf(state, sizeof(state), "%s", crosshair::Enabled() ? "on" : "off");
@@ -2432,7 +2973,7 @@ void App::DrawCrosshair() {
 
     NavScrollTo(static_cast<int>(Section::Crosshair), 0);
 
-    Glass::BeginPanel("appearance  -  shape, colour, size");
+    Glass::BeginPanel("appearance");
 
     bool on = crosshair::Enabled();
     if (Glass::Toggle("show the crosshair", &on)) {
@@ -2443,12 +2984,105 @@ void App::DrawCrosshair() {
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     std::vector<std::pair<std::string, bool>> chips;
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 6; ++i)
         chips.push_back({kShapes[i], i == crosshair::Shape()});
     std::vector<int> hits;
     if (ChipRow(chips, &hits))
         crosshair::SetShape(hits[0]);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    if (crosshair::Shape() == 5) {
+        static int paintMode = 0;
+        if (Glass::Chip("draw", paintMode == 0))
+            paintMode = 0;
+        ImGui::SameLine(0.0f, 8.0f);
+        if (Glass::Chip("erase", paintMode == 1))
+            paintMode = 1;
+        ImGui::SameLine(0.0f, 8.0f);
+        if (Glass::Chip("clear", false)) {
+            crosshair::ClearGrid();
+            crosshair::SaveGrid();
+        }
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+        const int   n     = crosshair::GridSize();
+        const float cell  = 9.0f;
+        const float side  = cell * static_cast<float>(n);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        if (avail > side)
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - side) * 0.5f);
+
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##xhair_grid", ImVec2(side, side));
+        const bool hover = ImGui::IsItemHovered() || ImGui::IsItemActive();
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side),
+                          IM_COL32(8, 10, 16, 255), 12.0f);
+        for (int i = 1; i < n; ++i) {
+            const float o    = static_cast<float>(i) * cell;
+            const ImU32 line = (i % 4 == 0) ? IM_COL32(255, 255, 255, 26)
+                                            : IM_COL32(255, 255, 255, 12);
+            dl->AddLine(ImVec2(p.x + o, p.y), ImVec2(p.x + o, p.y + side), line);
+            dl->AddLine(ImVec2(p.x, p.y + o), ImVec2(p.x + side, p.y + o), line);
+        }
+
+        float* rgb = crosshair::Rgb();
+        const ImU32 col =
+            IM_COL32(static_cast<int>(rgb[0] * 255.0f),
+                     static_cast<int>(rgb[1] * 255.0f),
+                     static_cast<int>(rgb[2] * 255.0f), 255);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x)
+                if (crosshair::GridPixel(x, y))
+                    dl->AddRectFilled(
+                        ImVec2(p.x + x * cell, p.y + y * cell),
+                        ImVec2(p.x + (x + 1) * cell, p.y + (y + 1) * cell), col);
+
+        dl->AddLine(ImVec2(p.x + side * 0.5f, p.y),
+                    ImVec2(p.x + side * 0.5f, p.y + side),
+                    IM_COL32(122, 152, 255, 90));
+        dl->AddLine(ImVec2(p.x, p.y + side * 0.5f),
+                    ImVec2(p.x + side, p.y + side * 0.5f),
+                    IM_COL32(122, 152, 255, 90));
+
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const int    mx    = static_cast<int>((mouse.x - p.x) / cell);
+        const int    my    = static_cast<int>((mouse.y - p.y) / cell);
+        if (hover && mx >= 0 && mx < n && my >= 0 && my < n)
+            dl->AddRect(ImVec2(p.x + mx * cell, p.y + my * cell),
+                        ImVec2(p.x + (mx + 1) * cell, p.y + (my + 1) * cell),
+                        IM_COL32(255, 255, 255, 120));
+
+        static int lastX = -1;
+        static int lastY = -1;
+        const bool left  = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        const bool right = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+        if (hover && (left || right) && mx >= 0 && mx < n && my >= 0 &&
+            my < n) {
+            const bool on = right ? false : paintMode == 0;
+            if (lastX >= 0 && lastY >= 0) {
+                const int steps = std::max(std::abs(mx - lastX),
+                                           std::abs(my - lastY));
+                for (int s = 1; s <= steps; ++s) {
+                    const int x = lastX + (mx - lastX) * s / steps;
+                    const int y = lastY + (my - lastY) * s / steps;
+                    crosshair::SetGridPixel(x, y, on);
+                }
+            } else {
+                crosshair::SetGridPixel(mx, my, on);
+            }
+            lastX = mx;
+            lastY = my;
+        }
+        if ((!left && !right) || !hover) {
+            lastX = -1;
+            lastY = -1;
+            crosshair::SaveGrid();
+        }
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    }
 
     Glass::ColorButton("crosshair colour", crosshair::Rgb());
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
@@ -2518,6 +3152,22 @@ void App::DrawCrosshair() {
                 dl->AddPolyline(pts, 4, col, t, ImDrawFlags_Closed);
                 break;
             }
+            case 5: {
+                const int   n    = crosshair::GridSize();
+                const float span = s * 2.0f;
+                const float cs   = span / static_cast<float>(n);
+                const float left = c.x - s;
+                const float top  = c.y - s;
+                for (int y = 0; y < n; ++y)
+                    for (int x = 0; x < n; ++x)
+                        if (crosshair::GridPixel(x, y))
+                            dl->AddRectFilled(
+                                ImVec2(left + x * cs, top + y * cs),
+                                ImVec2(left + (x + 1) * cs + 0.4f,
+                                       top + (y + 1) * cs + 0.4f),
+                                col);
+                break;
+            }
             default:
                 dl->AddLine(ImVec2(c.x, c.y - s), ImVec2(c.x, c.y + s), col, t);
                 dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), col, t);
@@ -2525,11 +3175,6 @@ void App::DrawCrosshair() {
         }
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
     }
-
-    Dim("The crosshair is its own always-on-top window at the exact centre "
-        "of the screen, transparent to clicks and never taking focus. Size "
-        "moves in steps of 2 from 2 to 50 px, thickness cycles through five "
-        "line widths.");
 
     Glass::EndPanel();
 
@@ -2571,10 +3216,6 @@ void App::DrawCrosshair() {
             recSlot = -1;
         }
     }
-
-    Dim("Click the button, then press the key you want. The key is global : "
-        "it fires even inside a game. Right-click clears the binding, Esc "
-        "cancels while recording.");
 
     const int cvk = HotkeyVk(3);
     const ImVec2 row = ImGui::GetCursorScreenPos();
@@ -2636,7 +3277,7 @@ void App::DrawOverlay() {
 
     NavScrollTo(static_cast<int>(Section::Overlay), 0);
 
-    Glass::BeginPanel("items  -  add images and gifs");
+    Glass::BeginPanel("items");
 
     if (Glass::Button("add an image", false, ImVec2(210.0f, 0.0f))) {
         if (overlay::AddFromDialog(0))
@@ -2651,8 +3292,7 @@ void App::DrawOverlay() {
 
     const int itemCount = overlay::Count();
     if (itemCount == 0)
-        Dim("Nothing yet. Add an image (png, jpg, jpeg, bmp, webp) or a gif "
-            "- it lands in the middle of the overlay and starts shown.");
+        Note("nothing added yet");
     bool removed = false;
     for (int i = 0; i < itemCount && !removed; ++i) {
         ImGui::PushID(i);
@@ -2682,16 +3322,20 @@ void App::DrawOverlay() {
         float op = overlay::Opacity() * 100.0f;
         if (Glass::Slider("item opacity", &op, 0.0f, 100.0f, "%.0f %%"))
             overlay::SetOpacity(op / 100.0f);
+
+        float rot = overlay::Rotation();
+        if (Glass::Slider("item rotation", &rot, -180.0f, 180.0f, "%.0f deg"))
+            overlay::SetRotation(rot);
     }
 
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Overlay), 1);
 
-    Glass::BeginPanel("position  -  quick placement");
+    Glass::BeginPanel("position");
 
     if (overlay::Selected() < 0) {
-        Dim("Select an item in the list above first.");
+        Note("select an item first");
     } else {
         std::vector<std::pair<std::string, bool>> place = {
             {"fullscreen", false}, {"centre", false},     {"top left", false},
@@ -2701,17 +3345,13 @@ void App::DrawOverlay() {
             overlay::Place(hits[0]);
             Toast(Glass::Icon::CheckCircle, kOk, "overlay", "item placed");
         }
-        ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        Dim("Drag the item on the overlay to move it, pull a corner handle "
-            "to resize it (20 px minimum). The selected item shows a cyan "
-            "dashed outline with handles.");
     }
 
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Overlay), 2);
 
-    Glass::BeginPanel("settings  -  resolution, keybind and behaviour");
+    Glass::BeginPanel("settings");
 
     static const char* kRes[4] = {"1920x1080", "1440x1080", "1280x720",
                                   "2560x1440"};
@@ -2734,31 +3374,24 @@ void App::DrawOverlay() {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
     bool click = overlay::ClickThrough();
-    if (Glass::Toggle("click through - the overlay never blocks the game",
-                      &click))
+    if (Glass::Toggle("click through", &click))
         overlay::SetClickThrough(click);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     bool lock = overlay::Locked();
-    if (Glass::Toggle("lock - no dragging, no selection", &lock))
+    if (Glass::Toggle("lock", &lock))
         overlay::SetLocked(lock);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     bool show = overlay::Visible();
     if (Glass::Toggle("show the overlay", &show))
         overlay::Show(show);
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-
-    Dim("The overlay is a single always-on-top window sized to the chosen "
-        "resolution, so it lines up with a game set to the same one. Click "
-        "through hands every mouse click to what is underneath, lock freezes "
-        "the items in place.");
 
     Glass::EndPanel();
 
     NavScrollTo(static_cast<int>(Section::Overlay), 3);
 
-    Glass::BeginPanel("configuration  -  save and load");
+    Glass::BeginPanel("configuration");
 
     if (Glass::Button("save configuration", false, ImVec2(210.0f, 0.0f))) {
         if (overlay::SaveDialog(overlay::VkToQtKey(HotkeyVk(4))))
@@ -2782,11 +3415,6 @@ void App::DrawOverlay() {
         settings::EnsureDir(settings::RootDir() + "\\overlays");
     InfoRow("last file", overlay::LastPath()[0] ? overlay::LastPath() : "none");
     InfoRow("folder", folder.c_str());
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    Dim("The file keeps every item (path, position, size, opacity, type) and "
-        "the keybind in the same JSON schema as the original OverlayApp, so "
-        "configs stay interchangeable. The default config.json in the folder "
-        "above loads automatically at startup.");
 
     Glass::EndPanel();
 }

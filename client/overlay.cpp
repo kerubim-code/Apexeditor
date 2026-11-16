@@ -20,19 +20,20 @@ namespace {
 
 constexpr int kRes[4][2] = {{1920, 1080}, {1440, 1080}, {1280, 720},
                             {2560, 1440}};
-constexpr int kMargin = 10;
+constexpr int   kRegionMargin = 64;
+constexpr int   kHandle       = 8;
+constexpr int   kGrab         = 18;
+constexpr int   kRotGap       = 34;
+constexpr float kPi           = 3.14159265f;
 
 enum Zone {
     Z_NONE = 0,
     Z_MOVE,
-    Z_LEFT,
-    Z_RIGHT,
-    Z_TOP,
-    Z_BOTTOM,
     Z_TOPLEFT,
     Z_TOPRIGHT,
     Z_BOTTOMLEFT,
     Z_BOTTOMRIGHT,
+    Z_ROTATE,
 };
 
 struct Item {
@@ -42,6 +43,7 @@ struct Item {
     int                w = 300;
     int                h = 300;
     float              opacity = 1.0f;
+    float              angle   = 0.0f;
     int                type    = 0;
     Gdiplus::Bitmap*   img     = nullptr;
     int                frames  = 1;
@@ -62,6 +64,19 @@ int                     g_resH        = 1080;
 int                     g_sel         = -1;
 int                     g_zone        = Z_NONE;
 POINT                   g_lastPt      = {0, 0};
+int                     g_dragItem    = -1;
+int                     g_dragX0      = 0;
+int                     g_dragY0      = 0;
+int                     g_dragW0      = 0;
+int                     g_dragH0      = 0;
+float                   g_dragAngle0  = 0.0f;
+float                   g_dragCX      = 0.0f;
+float                   g_dragCY      = 0.0f;
+float                   g_dragFixedX  = 0.0f;
+float                   g_dragFixedY  = 0.0f;
+float                   g_dragMouse0  = 0.0f;
+int                     g_dragSignX   = 1;
+int                     g_dragSignY   = 1;
 bool                    g_dirty       = true;
 bool                    g_regionDirty = true;
 std::string             g_lastPath;
@@ -250,21 +265,97 @@ Gdiplus::Bitmap* LoadBitmap(const std::string& path, int type, int* frames,
     return img;
 }
 
-Zone DetectZone(const RECT& r, int px, int py) {
-    const bool l = std::abs(px - r.left) < kMargin;
-    const bool rt = std::abs(px - r.right) < kMargin;
-    const bool t = std::abs(py - r.top) < kMargin;
-    const bool b = std::abs(py - r.bottom) < kMargin;
+void RotatePoint(float* x, float* y, float cx, float cy, float degrees) {
+    const float r = degrees * kPi / 180.0f;
+    const float c = std::cos(r);
+    const float s = std::sin(r);
+    const float dx = *x - cx;
+    const float dy = *y - cy;
+    *x = cx + dx * c - dy * s;
+    *y = cy + dx * s + dy * c;
+}
 
-    if (t && l) return Z_TOPLEFT;
-    if (t && rt) return Z_TOPRIGHT;
-    if (b && l) return Z_BOTTOMLEFT;
-    if (b && rt) return Z_BOTTOMRIGHT;
-    if (l) return Z_LEFT;
-    if (rt) return Z_RIGHT;
-    if (t) return Z_TOP;
-    if (b) return Z_BOTTOM;
-    return Z_MOVE;
+void ItemCenter(const Item& it, float* cx, float* cy) {
+    *cx = static_cast<float>(it.x) + static_cast<float>(it.w) * 0.5f;
+    *cy = static_cast<float>(it.y) + static_cast<float>(it.h) * 0.5f;
+}
+
+// Local, unrotated coordinates of a screen point relative to the item centre.
+void ToLocal(const Item& it, int px, int py, float* lx, float* ly) {
+    float cx = 0.0f, cy = 0.0f;
+    ItemCenter(it, &cx, &cy);
+    *lx = static_cast<float>(px);
+    *ly = static_cast<float>(py);
+    RotatePoint(lx, ly, cx, cy, -it.angle);
+}
+
+bool LocalInside(const Item& it, float lx, float ly) {
+    return lx >= static_cast<float>(it.x) &&
+           lx < static_cast<float>(it.x + it.w) &&
+           ly >= static_cast<float>(it.y) &&
+           ly < static_cast<float>(it.y + it.h);
+}
+
+bool InsideItem(const Item& it, int px, int py) {
+    float lx = 0.0f, ly = 0.0f;
+    ToLocal(it, px, py, &lx, &ly);
+    return LocalInside(it, lx, ly);
+}
+
+// Rotation handle sits above the top edge in the item's own frame.
+void RotationHandle(const Item& it, float* hx, float* hy) {
+    float cx = 0.0f, cy = 0.0f;
+    ItemCenter(it, &cx, &cy);
+    *hx = cx;
+    *hy = cy - static_cast<float>(it.h) * 0.5f - kRotGap;
+    RotatePoint(hx, hy, cx, cy, it.angle);
+}
+
+Zone DetectZone(const Item& it, int px, int py) {
+    float hx = 0.0f, hy = 0.0f;
+    RotationHandle(it, &hx, &hy);
+    const float rdx = static_cast<float>(px) - hx;
+    const float rdy = static_cast<float>(py) - hy;
+    if (rdx * rdx + rdy * rdy <= static_cast<float>(kGrab * kGrab))
+        return Z_ROTATE;
+
+    float lx = 0.0f, ly = 0.0f;
+    ToLocal(it, px, py, &lx, &ly);
+    const float gx0 = static_cast<float>(it.x) - kGrab * 0.5f;
+    const float gx1 = static_cast<float>(it.x + it.w) + kGrab * 0.5f;
+    const float gy0 = static_cast<float>(it.y) - kGrab * 0.5f;
+    const float gy1 = static_cast<float>(it.y + it.h) + kGrab * 0.5f;
+
+    if (lx >= gx0 && lx <= gx1 && ly >= gy0 && ly <= gy1) {
+        const bool l = lx <= static_cast<float>(it.x) + kGrab * 0.5f;
+        const bool r = lx >= static_cast<float>(it.x + it.w) - kGrab * 0.5f;
+        const bool t = ly <= static_cast<float>(it.y) + kGrab * 0.5f;
+        const bool b = ly >= static_cast<float>(it.y + it.h) - kGrab * 0.5f;
+        if (t && l) return Z_TOPLEFT;
+        if (t && r) return Z_TOPRIGHT;
+        if (b && l) return Z_BOTTOMLEFT;
+        if (b && r) return Z_BOTTOMRIGHT;
+    }
+    return LocalInside(it, lx, ly) ? Z_MOVE : Z_NONE;
+}
+
+void ItemAabb(const Item& it, float* l, float* t, float* r, float* b) {
+    const float cx = static_cast<float>(it.x) + static_cast<float>(it.w) * 0.5f;
+    const float cy = static_cast<float>(it.y) + static_cast<float>(it.h) * 0.5f;
+    float xs[4] = {static_cast<float>(it.x), static_cast<float>(it.x + it.w),
+                   static_cast<float>(it.x + it.w), static_cast<float>(it.x)};
+    float ys[4] = {static_cast<float>(it.y), static_cast<float>(it.y),
+                   static_cast<float>(it.y + it.h),
+                   static_cast<float>(it.y + it.h)};
+    *l = *t = 1e9f;
+    *r = *b = -1e9f;
+    for (int i = 0; i < 4; ++i) {
+        RotatePoint(&xs[i], &ys[i], cx, cy, it.angle);
+        *l = std::min(*l, xs[i]);
+        *t = std::min(*t, ys[i]);
+        *r = std::max(*r, xs[i]);
+        *b = std::max(*b, ys[i]);
+    }
 }
 
 void RebuildRegion() {
@@ -282,9 +373,15 @@ void RebuildRegion() {
     HRGN region = CreateRectRgn(0, 0, 0, 0);
     for (size_t i = 0; i < g_items.size(); ++i) {
         const Item& it = g_items[i];
-        const int m = (static_cast<int>(i) == g_sel && !g_lock) ? kMargin : 0;
-        HRGN part = CreateRectRgn(it.x - m, it.y - m, it.x + it.w + m,
-                                  it.y + it.h + m);
+        float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
+        ItemAabb(it, &l, &t, &r, &b);
+        const int m = (static_cast<int>(i) == g_sel && !g_lock)
+                          ? kRegionMargin
+                          : 0;
+        HRGN part = CreateRectRgn(static_cast<int>(std::floor(l)) - m,
+                                  static_cast<int>(std::floor(t)) - m,
+                                  static_cast<int>(std::ceil(r)) + m,
+                                  static_cast<int>(std::ceil(b)) + m);
         CombineRgn(region, region, part, RGN_OR);
         DeleteObject(part);
     }
@@ -348,21 +445,41 @@ void Render() {
                                      static_cast<Gdiplus::REAL>(it.y),
                                      static_cast<Gdiplus::REAL>(it.w),
                                      static_cast<Gdiplus::REAL>(it.h));
+            float cx = 0.0f, cy = 0.0f;
+            ItemCenter(it, &cx, &cy);
+            Gdiplus::Matrix saved;
+            Gdiplus::Matrix transform;
+            transform.Translate(cx, cy);
+            transform.Rotate(it.angle);
+            transform.Translate(-cx, -cy);
+            g.GetTransform(&saved);
+            g.SetTransform(&transform);
             g.DrawImage(it.img, dst, 0.0f, 0.0f,
                         static_cast<Gdiplus::REAL>(it.img->GetWidth()),
                         static_cast<Gdiplus::REAL>(it.img->GetHeight()),
                         Gdiplus::UnitPixel, &attrs);
+            g.SetTransform(&saved);
         }
 
         if (g_sel >= 0 && g_sel < static_cast<int>(g_items.size()) && !g_lock) {
             const Item& it = g_items[static_cast<size_t>(g_sel)];
+            float cx = 0.0f, cy = 0.0f;
+            ItemCenter(it, &cx, &cy);
+            Gdiplus::Matrix saved;
+            Gdiplus::Matrix transform;
+            transform.Translate(cx, cy);
+            transform.Rotate(it.angle);
+            transform.Translate(-cx, -cy);
+            g.GetTransform(&saved);
+            g.SetTransform(&transform);
+
             const Gdiplus::Color cyan(255, 0, 255, 255);
             Gdiplus::Pen pen(cyan, 2.0f);
             pen.SetDashStyle(Gdiplus::DashStyleDash);
             g.DrawRectangle(&pen, it.x, it.y, it.w, it.h);
 
             Gdiplus::SolidBrush brush(cyan);
-            const int hs = kMargin * 2;
+            const int hs = kHandle;
             const int corners[4][2] = {{it.x, it.y},
                                        {it.x + it.w, it.y},
                                        {it.x, it.y + it.h},
@@ -370,6 +487,16 @@ void Render() {
             for (const auto& corner : corners)
                 g.FillRectangle(&brush, corner[0] - hs / 2, corner[1] - hs / 2,
                                 hs, hs);
+            g.SetTransform(&saved);
+
+            float hx = 0.0f, hy = 0.0f;
+            RotationHandle(it, &hx, &hy);
+            float tx = cx, ty = static_cast<float>(it.y);
+            RotatePoint(&tx, &ty, cx, cy, it.angle);
+            Gdiplus::Pen stem(cyan, 2.0f);
+            g.DrawLine(&stem, tx, ty, hx, hy);
+            g.FillEllipse(&brush, hx - hs * 0.75f, hy - hs * 0.75f,
+                          hs * 1.5f, hs * 1.5f);
         }
     }
 
@@ -399,7 +526,7 @@ void FreeItems() {
 }
 
 void PushItem(const std::string& path, int x, int y, int w, int h,
-              float opacity, int type) {
+              float opacity, int type, float angle) {
     Item it;
     it.path    = path;
     it.x       = x;
@@ -407,6 +534,7 @@ void PushItem(const std::string& path, int x, int y, int w, int h,
     it.w       = w > 0 ? w : 300;
     it.h       = h > 0 ? h : 300;
     it.opacity = opacity < 0.0f ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
+    it.angle   = angle;
     it.type    = type == 1 ? 1 : 0;
     it.img     = LoadBitmap(path, it.type, &it.frames, &it.delays);
     if (it.img == nullptr) {
@@ -458,8 +586,10 @@ bool LoadPath(const std::string& path, int* qtKeybind) {
             const int h = static_cast<int>(JsonNumber(obj, "h", 300));
             const float opacity =
                 static_cast<float>(JsonNumber(obj, "opacity", 1.0));
+            const float angle =
+                static_cast<float>(JsonNumber(obj, "angle", 0.0));
             const int type = static_cast<int>(JsonNumber(obj, "type", 0));
-            PushItem(file, x, y, w, h, opacity, type);
+            PushItem(file, x, y, w, h, opacity, type, angle);
         }
         p = objEnd + 1;
     }
@@ -497,6 +627,9 @@ bool SavePath(const std::string& path, int qtKeybind) {
         out += ",\"opacity\":";
         std::snprintf(number, sizeof(number), "%g", it.opacity);
         out += number;
+        out += ",\"angle\":";
+        std::snprintf(number, sizeof(number), "%g", it.angle);
+        out += number;
         out += ",\"type\":";
         std::snprintf(number, sizeof(number), "%d", it.type);
         out += number;
@@ -517,100 +650,129 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 break;
             const int px = GET_X_LPARAM(lParam);
             const int py = GET_Y_LPARAM(lParam);
+
             int hit = -1;
-            for (int i = static_cast<int>(g_items.size()) - 1; i >= 0; --i) {
-                const Item& it = g_items[static_cast<size_t>(i)];
-                if (px >= it.x && px < it.x + it.w && py >= it.y &&
-                    py < it.y + it.h) {
-                    hit = i;
-                    break;
+            if (g_sel >= 0 && g_sel < static_cast<int>(g_items.size())) {
+                const Item& sel = g_items[static_cast<size_t>(g_sel)];
+                if (DetectZone(sel, px, py) != Z_NONE)
+                    hit = g_sel;
+            }
+            if (hit < 0) {
+                for (int i = static_cast<int>(g_items.size()) - 1; i >= 0; --i) {
+                    if (InsideItem(g_items[static_cast<size_t>(i)], px, py)) {
+                        hit = i;
+                        break;
+                    }
                 }
             }
-            if (hit >= 0) {
-                g_sel        = hit;
-                g_lastPt.x   = px;
-                g_lastPt.y   = py;
-                const Item& it = g_items[static_cast<size_t>(hit)];
-                const RECT r = {it.x, it.y, it.x + it.w, it.y + it.h};
-                g_zone = DetectZone(r, px, py);
-                SetCapture(hWnd);
-                g_dirty       = true;
-                g_regionDirty = true;
-            } else if (g_sel != -1) {
-                g_sel         = -1;
-                g_dirty       = true;
-                g_regionDirty = true;
+
+            if (hit < 0) {
+                if (g_sel != -1) {
+                    g_sel         = -1;
+                    g_dirty       = true;
+                    g_regionDirty = true;
+                }
+                return 0;
             }
+
+            g_sel  = hit;
+            Item& it = g_items[static_cast<size_t>(hit)];
+            g_zone = DetectZone(it, px, py);
+            if (g_zone == Z_NONE)
+                g_zone = Z_MOVE;
+
+            g_dragItem = hit;
+            g_dragX0   = it.x;
+            g_dragY0   = it.y;
+            g_dragW0   = it.w;
+            g_dragH0   = it.h;
+            g_dragAngle0 = it.angle;
+            g_lastPt.x   = px;
+            g_lastPt.y   = py;
+
+            float cx = 0.0f, cy = 0.0f;
+            ItemCenter(it, &cx, &cy);
+            g_dragCX = cx;
+            g_dragCY = cy;
+            g_dragMouse0 =
+                std::atan2(static_cast<float>(py) - cy,
+                           static_cast<float>(px) - cx);
+
+            if (g_zone == Z_TOPLEFT || g_zone == Z_TOPRIGHT ||
+                g_zone == Z_BOTTOMLEFT || g_zone == Z_BOTTOMRIGHT) {
+                g_dragSignX = (g_zone == Z_TOPLEFT ||
+                               g_zone == Z_BOTTOMLEFT)
+                                  ? -1
+                                  : 1;
+                g_dragSignY = (g_zone == Z_TOPLEFT ||
+                               g_zone == Z_TOPRIGHT)
+                                  ? -1
+                                  : 1;
+                const float fx =
+                    cx + static_cast<float>(-g_dragSignX * it.w) * 0.5f;
+                const float fy =
+                    cy + static_cast<float>(-g_dragSignY * it.h) * 0.5f;
+                g_dragFixedX = fx;
+                g_dragFixedY = fy;
+                RotatePoint(&g_dragFixedX, &g_dragFixedY, cx, cy, it.angle);
+            }
+
+            SetCapture(hWnd);
+            g_dirty       = true;
+            g_regionDirty = true;
             return 0;
         }
         case WM_MOUSEMOVE: {
-            if (g_click || g_lock || g_zone == Z_NONE ||
-                GetCapture() != hWnd || g_sel < 0 ||
-                g_sel >= static_cast<int>(g_items.size()))
+            if (g_click || g_lock || GetCapture() != hWnd ||
+                g_zone == Z_NONE || g_dragItem < 0 ||
+                g_dragItem >= static_cast<int>(g_items.size()))
                 break;
             const int px = GET_X_LPARAM(lParam);
             const int py = GET_Y_LPARAM(lParam);
-            const int dx = px - g_lastPt.x;
-            const int dy = py - g_lastPt.y;
-            Item& it = g_items[static_cast<size_t>(g_sel)];
-            constexpr int minW = 20;
-            constexpr int minH = 20;
-            switch (g_zone) {
-                case Z_MOVE:
-                    it.x += dx;
-                    it.y += dy;
-                    break;
-                case Z_LEFT:
-                    if (it.w - dx >= minW) {
-                        it.x += dx;
-                        it.w -= dx;
-                    }
-                    break;
-                case Z_RIGHT:
-                    it.w = std::max(minW, it.w + dx);
-                    break;
-                case Z_TOP:
-                    if (it.h - dy >= minH) {
-                        it.y += dy;
-                        it.h -= dy;
-                    }
-                    break;
-                case Z_BOTTOM:
-                    it.h = std::max(minH, it.h + dy);
-                    break;
-                case Z_TOPLEFT:
-                    if (it.w - dx >= minW) {
-                        it.x += dx;
-                        it.w -= dx;
-                    }
-                    if (it.h - dy >= minH) {
-                        it.y += dy;
-                        it.h -= dy;
-                    }
-                    break;
-                case Z_TOPRIGHT:
-                    it.w = std::max(minW, it.w + dx);
-                    if (it.h - dy >= minH) {
-                        it.y += dy;
-                        it.h -= dy;
-                    }
-                    break;
-                case Z_BOTTOMLEFT:
-                    if (it.w - dx >= minW) {
-                        it.x += dx;
-                        it.w -= dx;
-                    }
-                    it.h = std::max(minH, it.h + dy);
-                    break;
-                case Z_BOTTOMRIGHT:
-                    it.w = std::max(minW, it.w + dx);
-                    it.h = std::max(minH, it.h + dy);
-                    break;
-                default:
-                    break;
+            Item& it = g_items[static_cast<size_t>(g_dragItem)];
+            constexpr int minW = 24;
+            constexpr int minH = 24;
+
+            if (g_zone == Z_MOVE) {
+                it.x = g_dragX0 + (px - g_lastPt.x);
+                it.y = g_dragY0 + (py - g_lastPt.y);
+            } else if (g_zone == Z_ROTATE) {
+                const float mouseAngle =
+                    std::atan2(static_cast<float>(py) - g_dragCY,
+                               static_cast<float>(px) - g_dragCX);
+                float degrees =
+                    g_dragAngle0 +
+                    (mouseAngle - g_dragMouse0) * 180.0f / kPi;
+                while (degrees > 180.0f)
+                    degrees -= 360.0f;
+                while (degrees < -180.0f)
+                    degrees += 360.0f;
+                if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+                    degrees = std::round(degrees / 15.0f) * 15.0f;
+                if (std::fabs(degrees) < 2.0f)
+                    degrees = 0.0f;
+                it.angle = degrees;
+            } else {
+                const float rad = g_dragAngle0 * kPi / 180.0f;
+                const float c   = std::cos(rad);
+                const float s   = std::sin(rad);
+                const float dx  = static_cast<float>(px) - g_dragFixedX;
+                const float dy  = static_cast<float>(py) - g_dragFixedY;
+                const float lx  = dx * c + dy * s;
+                const float ly  = -dx * s + dy * c;
+                float newW = static_cast<float>(g_dragSignX) * lx;
+                float newH = static_cast<float>(g_dragSignY) * ly;
+                newW = std::max(static_cast<float>(minW), newW);
+                newH = std::max(static_cast<float>(minH), newH);
+                const float hx = static_cast<float>(g_dragSignX) * newW * 0.5f;
+                const float hy = static_cast<float>(g_dragSignY) * newH * 0.5f;
+                const float wcx = g_dragFixedX + hx * c - hy * s;
+                const float wcy = g_dragFixedY + hx * s + hy * c;
+                it.w = static_cast<int>(std::lround(newW));
+                it.h = static_cast<int>(std::lround(newH));
+                it.x = static_cast<int>(std::lround(wcx - newW * 0.5f));
+                it.y = static_cast<int>(std::lround(wcy - newH * 0.5f));
             }
-            g_lastPt.x    = px;
-            g_lastPt.y    = py;
             g_dirty       = true;
             g_regionDirty = true;
             return 0;
@@ -620,13 +782,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReleaseCapture();
             if (g_zone != Z_NONE) {
                 g_zone        = Z_NONE;
+                g_dragItem    = -1;
                 g_regionDirty = true;
                 g_dirty       = true;
             }
             return 0;
         }
         case WM_CAPTURECHANGED:
-            g_zone = Z_NONE;
+            g_zone     = Z_NONE;
+            g_dragItem = -1;
             break;
         default:
             break;
@@ -820,6 +984,27 @@ void SetOpacity(float opacity) {
     g_dirty    = true;
 }
 
+float Rotation() {
+    if (g_sel < 0 || g_sel >= static_cast<int>(g_items.size()))
+        return 0.0f;
+    return g_items[static_cast<size_t>(g_sel)].angle;
+}
+
+void SetRotation(float degrees) {
+    if (g_sel < 0 || g_sel >= static_cast<int>(g_items.size()))
+        return;
+    while (degrees > 180.0f)
+        degrees -= 360.0f;
+    while (degrees < -180.0f)
+        degrees += 360.0f;
+    Item& it = g_items[static_cast<size_t>(g_sel)];
+    if (std::fabs(it.angle - degrees) < 0.01f)
+        return;
+    it.angle      = degrees;
+    g_dirty       = true;
+    g_regionDirty = true;
+}
+
 bool AddFromDialog(int type) {
     if (g_hwnd == nullptr)
         return false;
@@ -925,6 +1110,7 @@ void Place(int mode) {
     if (g_sel < 0 || g_sel >= static_cast<int>(g_items.size()))
         return;
     Item& it = g_items[static_cast<size_t>(g_sel)];
+    it.angle = 0.0f;
     switch (mode) {
         case 0:
             it.x = 0;

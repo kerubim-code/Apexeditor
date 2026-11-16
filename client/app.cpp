@@ -23,6 +23,9 @@ bool  g_playerOverlay  = settings::GetBool("spotify_overlay", false);
 float g_playerOpacity  = static_cast<float>(
     std::max(25, std::min(100, settings::GetInt("spotify_overlay_opacity", 85))));
 bool  g_playerLyrics   = settings::GetBool("spotify_lyrics", true);
+bool  g_guiTransparency = settings::GetBool("gui_transparency", false);
+bool  g_showOverlayCategory = false;
+bool  g_showSpotifyCategory = false;
 bool  g_overlayItemHover = false;
 ImFont* g_ovrFontSemi  = nullptr;
 
@@ -63,26 +66,13 @@ const char* SectionName(Section section) {
         case Section::Custom:       return "Custom";
         case Section::Color:        return "Color";
         case Section::Optimization: return "Optimization";
-        case Section::Config:       return "Config";
         case Section::Spotify:      return "Spotify";
         case Section::Crosshair:    return "Crosshair";
         case Section::Overlay:      return "Overlay";
+        case Section::Misc:         return "Misc";
+        case Section::Config:       return "Config";
     }
     return "Section";
-}
-
-const char* SectionSubtitle(Section section) {
-    switch (section) {
-        case Section::VideoCfg:     return "kerubimm files - download and install";
-        case Section::Custom:       return "resolution, fov, textures and anti-aliasing";
-        case Section::Color:        return "saturation, contrast and screen profile";
-        case Section::Optimization: return "autoexec.cfg and system tuning";
-        case Section::Config:       return "profiles, startup options and saved data";
-        case Section::Spotify:      return "now playing, overlay player and lyrics";
-        case Section::Crosshair:    return "screen crosshair - shape, colour, size";
-        case Section::Overlay:      return "images and gifs on an always-on-top overlay";
-    }
-    return "";
 }
 
 void CenterLine(const char* text, ImFont* font, float fontSize, ImU32 color) {
@@ -187,6 +177,15 @@ App& App::Get() {
 void App::Init(HWND hwnd) {
     hwnd_ = hwnd;
 
+    g_showOverlayCategory = settings::GetBool("overlay_category", false);
+    g_showSpotifyCategory = settings::GetBool("spotify_category", false);
+    if (!g_showOverlayCategory)
+        settings::SetBool("overlay_on", false);
+    if (!g_showSpotifyCategory) {
+        g_playerOverlay = false;
+        settings::SetBool("spotify_overlay", false);
+    }
+
     if (settings::GetBool("boot_animation", true)) {
         bootStart_ = GetTickCount64();
     } else {
@@ -196,6 +195,7 @@ void App::Init(HWND hwnd) {
 
     vibranceClosed_ = CloseVibranceGUI();
 
+    color::VibranceEngine::Get().Load();
     if (settings::GetBool("start_engine", true))
         color::VibranceEngine::Get().Start();
 
@@ -207,10 +207,23 @@ void App::Init(HWND hwnd) {
                 settings::SetInt("section", old + 1);
             settings::SetBool("section_shifted", true);
         }
+
+        if (!settings::GetBool("section_layout_v11", false)) {
+            static const int kLayoutMap[8] = {0, 1, 2, 3, 8, 4, 5, 6};
+            const int previous = settings::GetInt("section", -1);
+            if (previous >= 0 && previous <= 7)
+                settings::SetInt("section", kLayoutMap[previous]);
+            settings::SetBool("section_layout_v11", true);
+        }
+
         const int saved = settings::GetInt("section", static_cast<int>(Section::Color));
         if (saved >= 0 && saved < kSectionCount)
             section = static_cast<Section>(saved);
     }
+
+    if ((section == Section::Overlay && !g_showOverlayCategory) ||
+        (section == Section::Spotify && !g_showSpotifyCategory))
+        section = Section::Misc;
 }
 
 void App::Shutdown() {
@@ -426,11 +439,6 @@ void App::DrawDashboard(const ImVec2& displaySize) {
             ImGui::TextUnformatted(SectionName(section));
         }
 
-        ImGui::SetCursorScreenPos(ImVec2(contentX, origin.y + 34.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-        ImGui::TextUnformatted(SectionSubtitle(section));
-        ImGui::PopStyleColor();
-
         {
             const char* stateText = "local mode";
             const float pillW = ImGui::CalcTextSize(stateText).x + 34.0f;
@@ -501,36 +509,61 @@ void App::DrawSidebar(const ImVec2& origin, float height) {
 
     static const Glass::Icon navIcons[kSectionCount] = {
         Glass::Icon::Download, Glass::Icon::Sliders, Glass::Icon::Palette,
-        Glass::Icon::Gauge, Glass::Icon::Gear, Glass::Icon::Spotify,
-        Glass::Icon::Crosshairs, Glass::Icon::Images};
+        Glass::Icon::Gauge, Glass::Icon::Spotify, Glass::Icon::Crosshairs,
+        Glass::Icon::Images, Glass::Icon::Wrench, Glass::Icon::Gear};
     static const char* navLabels[kSectionCount] = {"apex video cfg", "Custom", "Color",
-                                                   "Optimization", "Config", "Spotify",
-                                                   "Crosshair", "Overlay"};
+                                                   "Optimization", "Spotify", "Crosshair",
+                                                   "Overlay", "Misc", "Config"};
     static const ImU32 navTints[kSectionCount]  = {IM_COL32(10, 132, 255, 255),
                                                    IM_COL32(255, 64, 128, 255),
                                                    IM_COL32(52, 199, 89, 255),
                                                    IM_COL32(255, 149, 0, 255),
-                                                   IM_COL32(176, 102, 255, 255),
                                                    IM_COL32(30, 215, 96, 255),
                                                    IM_COL32(0, 224, 255, 255),
-                                                   IM_COL32(255, 69, 58, 255)};
+                                                   IM_COL32(255, 69, 58, 255),
+                                                   IM_COL32(188, 196, 214, 255),
+                                                   IM_COL32(176, 102, 255, 255)};
 
     static const char* kSubsVideo[]   = {"launch", "install", "files"};
     static const char* kSubsCustom[]  = {"resolution", "fov", "textures",
-                                         "antialiasing"};
+                                         "antialiasing", "gamma"};
     static const char* kSubsColor[]   = {"profile", "detect", "rules"};
     static const char* kSubsOpt[]     = {"autoexec"};
-    static const char* kSubsConfig[]  = {"profiles", "startup", "branding",
-                                         "maintenance"};
+    static const char* kSubsConfig[]  = {"settings", "startup"};
     static const char* kSubsSpotify[] = {"song", "lyrics", "keybind"};
     static const char* kSubsCross[]   = {"appearance", "hotkey"};
     static const char* kSubsOverlay[] = {"items", "position", "settings",
                                          "configuration"};
+    static const char* kSubsMisc[]    = {"interface"};
     static const char* const* kNavSubs[kSectionCount] = {
-        kSubsVideo, kSubsCustom, kSubsColor, kSubsOpt, kSubsConfig, kSubsSpotify,
-        kSubsCross, kSubsOverlay};
-    static const int kNavSubCount[kSectionCount] = {3, 4, 3, 1, 4, 3, 2, 4};
+        kSubsVideo, kSubsCustom, kSubsColor, kSubsOpt, kSubsSpotify, kSubsCross,
+        kSubsOverlay, kSubsMisc, kSubsConfig};
+    static const int kNavSubCount[kSectionCount] = {3, 5, 3, 1, 3, 2, 4, 1, 2};
     static int navExpanded = -1;
+
+    int                visToSec[kSectionCount];
+    int                secToVis[kSectionCount];
+    Glass::Icon        visIcons[kSectionCount];
+    const char*        visLabels[kSectionCount];
+    ImU32              visTints[kSectionCount];
+    const char* const* visSubs[kSectionCount];
+    int                visSubCount[kSectionCount];
+    int                visCount = 0;
+    for (int i = 0; i < kSectionCount; ++i) {
+        secToVis[i] = -1;
+        if (i == static_cast<int>(Section::Spotify) && !g_showSpotifyCategory)
+            continue;
+        if (i == static_cast<int>(Section::Overlay) && !g_showOverlayCategory)
+            continue;
+        visToSec[visCount]  = i;
+        secToVis[i]         = visCount;
+        visIcons[visCount]  = navIcons[i];
+        visLabels[visCount] = navLabels[i];
+        visTints[visCount]  = navTints[i];
+        visSubs[visCount]   = kNavSubs[i];
+        visSubCount[visCount] = kNavSubCount[i];
+        ++visCount;
+    }
 
     const float navTop  = origin.y + 74.0f;
     const float navH    = height - 74.0f - 124.0f - 8.0f;
@@ -538,35 +571,40 @@ void App::DrawSidebar(const ImVec2& origin, float height) {
     ImGui::BeginChild("apexnavscroll", ImVec2(sideW - 16.0f, navH),
                       ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
-    const int current = static_cast<int>(section);
+    const int current = secToVis[static_cast<int>(section)];
+    const int expandedVis =
+        (navExpanded >= 0 && navExpanded < kSectionCount) ? secToVis[navExpanded]
+                                                          : -1;
     const int picked =
-        Glass::SidebarNav("apexnav", navIcons, navLabels, navTints, kSectionCount,
+        Glass::SidebarNav("apexnav", visIcons, visLabels, visTints, visCount,
                           current, sideW - 16.0f, 50.0f,
-                          kNavSubs, kNavSubCount, navExpanded);
+                          visSubs, visSubCount, expandedVis);
     ImGui::EndChild();
     if (picked >= 0) {
-        if (picked < kSectionCount) {
+        if (picked < visCount) {
 
+            const int sec = visToSec[picked];
             if (picked == current) {
-                navExpanded = (navExpanded == picked) ? -1 : picked;
+                navExpanded = (navExpanded == sec) ? -1 : sec;
             } else {
-                section = static_cast<Section>(picked);
-                navExpanded = picked;
+                section = static_cast<Section>(sec);
+                navExpanded = sec;
                 if (settings::GetBool("remember_section", true))
-                    settings::SetInt("section", picked);
+                    settings::SetInt("section", sec);
             }
         } else {
 
-            const int flat = picked - kSectionCount;
-            int sec = 0, sub = 0, acc = 0;
-            for (; sec < kSectionCount; ++sec) {
-                if (flat < acc + kNavSubCount[sec]) {
+            const int flat = picked - visCount;
+            int vis = 0, sub = 0, acc = 0;
+            for (; vis < visCount; ++vis) {
+                if (flat < acc + visSubCount[vis]) {
                     sub = flat - acc;
                     break;
                 }
-                acc += kNavSubCount[sec];
+                acc += visSubCount[vis];
             }
-            if (sec < kSectionCount) {
+            if (vis < visCount) {
+                const int sec = visToSec[vis];
                 section = static_cast<Section>(sec);
                 navExpanded = sec;
                 g_navPendingSection = sec;
@@ -640,15 +678,20 @@ void App::DrawContent(const ImVec2& origin, float width, float height) {
     if (Glass::g != nullptr)
         Glass::g->SetClipRect(origin.x, origin.y, origin.x + width, origin.y + height);
 
+    if ((section == Section::Overlay && !g_showOverlayCategory) ||
+        (section == Section::Spotify && !g_showSpotifyCategory))
+        section = Section::Misc;
+
     switch (section) {
         case Section::VideoCfg:     DrawVideoCfg();     break;
         case Section::Custom:       DrawCustom();       break;
         case Section::Color:        DrawColor();        break;
         case Section::Optimization: DrawOptimization(); break;
-        case Section::Config:       DrawConfig();       break;
         case Section::Spotify:      DrawSpotify();      break;
         case Section::Crosshair:    DrawCrosshair();    break;
         case Section::Overlay:      DrawOverlay();      break;
+        case Section::Misc:         DrawMisc();         break;
+        case Section::Config:       DrawConfig();       break;
     }
 
     Glass::DrawColorPickerModal();

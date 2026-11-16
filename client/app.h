@@ -23,20 +23,24 @@ enum class Section {
     Custom       = 1,
     Color        = 2,
     Optimization = 3,
-    Config       = 4,
-    Spotify      = 5,
-    Crosshair    = 6,
-    Overlay      = 7,
+    Spotify      = 4,
+    Crosshair    = 5,
+    Overlay      = 6,
+    Misc         = 7,
+    Config       = 8,
 };
 
-constexpr int   kSectionCount   = 8;
+constexpr int   kSectionCount   = 9;
 constexpr float kSidebarWidth  = 231.0f;
 
 ID3D11Device* Device();
 
 extern bool  g_playerOverlay;
 extern float g_playerOpacity;
+extern bool  g_guiTransparency;
 extern bool  g_playerLyrics;
+extern bool  g_showOverlayCategory;
+extern bool  g_showSpotifyCategory;
 extern bool  g_overlayItemHover;
 extern ImFont* g_ovrFontSemi;
 
@@ -71,6 +75,7 @@ public:
     void DrawSpotify();
     void DrawCrosshair();
     void DrawOverlay();
+    void DrawMisc();
 
     void DrawSpotifyOverlay(float width, float height);
 

@@ -15,7 +15,10 @@
 #include <urlmon.h>
 
 #include <cwchar>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 
@@ -29,6 +32,9 @@ constexpr const char* kRepo =
     "https://raw.githubusercontent.com/kerubim-code/APEX-SETTINGS/main";
 
 constexpr const char* kSteamAppId = "1172470";
+
+constexpr const char* kMatLaunchArg  = "+mat_letterbox_aspect_min 1.0";
+constexpr const char* kExecLaunchArg = "+exec autoexec.cfg";
 
 constexpr const char* kGameExes[] = {"r5apex_dx12.exe", "r5apex.exe"};
 
@@ -282,6 +288,473 @@ bool SteamRunning() {
     return running;
 }
 
+std::string TrimText(const std::string& text) {
+    size_t first = 0;
+    size_t last  = text.size();
+    while (first < last && (text[first] == ' ' || text[first] == '\t' ||
+                            text[first] == '\r' || text[first] == '\n'))
+        ++first;
+    while (last > first && (text[last - 1] == ' ' || text[last - 1] == '\t' ||
+                            text[last - 1] == '\r' || text[last - 1] == '\n'))
+        --last;
+    return text.substr(first, last - first);
+}
+
+std::string LowerText(const std::string& text) {
+    std::string out = text;
+    for (char& c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+bool ContainsNoCase(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    return LowerText(haystack).find(LowerText(needle)) != std::string::npos;
+}
+
+std::string ReadWholeFile(const std::string& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    if (!in) return std::string();
+    std::string text;
+    text.assign(std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>());
+    return text;
+}
+
+std::string UnescapeVdf(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\' && i + 1 < value.size()) {
+            out += value[i + 1];
+            ++i;
+        } else {
+            out += value[i];
+        }
+    }
+    return out;
+}
+
+struct TextLine {
+    size_t start = 0;
+    size_t end   = 0;
+    size_t next  = 0;
+};
+
+std::vector<TextLine> SplitTextLines(const std::string& text) {
+    std::vector<TextLine> lines;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t newline = text.find('\n', pos);
+        size_t       end     = newline == std::string::npos ? text.size() : newline;
+        const size_t next    = newline == std::string::npos ? text.size() : newline + 1;
+        if (end > pos && text[end - 1] == '\r') --end;
+        lines.push_back(TextLine{pos, end, next});
+        if (newline == std::string::npos) break;
+        pos = newline + 1;
+    }
+    return lines;
+}
+
+std::string LineText(const std::string& text, const TextLine& line) {
+    return text.substr(line.start, line.end - line.start);
+}
+
+int BraceDelta(const std::string& line) {
+    int  depth  = 0;
+    bool quoted = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (quoted) {
+            if (c == '\\' && i + 1 < line.size()) {
+                ++i;
+                continue;
+            }
+            if (c == '"') quoted = false;
+            continue;
+        }
+        if (c == '"') {
+            quoted = true;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+        }
+    }
+    return depth;
+}
+
+bool IsOpenBraceLine(const std::string& line) {
+    return TrimText(line) == "{";
+}
+
+bool ParseQuoted(const std::string& line, size_t& pos, std::string* value,
+                 size_t* openPos, size_t* closePos) {
+    while (pos < line.size() &&
+           (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' ||
+            line[pos] == '\n'))
+        ++pos;
+    if (pos >= line.size() || line[pos] != '"') return false;
+
+    const size_t open = pos++;
+    std::string  out;
+    while (pos < line.size()) {
+        const char c = line[pos];
+        if (c == '\\' && pos + 1 < line.size()) {
+            out += c;
+            out += line[pos + 1];
+            pos += 2;
+            continue;
+        }
+        if (c == '"') {
+            if (value) *value = out;
+            if (openPos) *openPos = open;
+            if (closePos) *closePos = pos;
+            ++pos;
+            return true;
+        }
+        out += c;
+        ++pos;
+    }
+    return false;
+}
+
+struct ParsedLine {
+    std::string key;
+    std::string value;
+    bool        hasValue   = false;
+    size_t      valueOpen  = 0;
+    size_t      valueClose = 0;
+};
+
+bool ParseVdfLine(const std::string& line, ParsedLine* out) {
+    size_t      pos = 0;
+    std::string key;
+    if (!ParseQuoted(line, pos, &key, nullptr, nullptr)) return false;
+
+    out->key      = key;
+    out->hasValue = false;
+    if (ParseQuoted(line, pos, &out->value, &out->valueOpen, &out->valueClose))
+        out->hasValue = true;
+    return true;
+}
+
+struct VdfBlock {
+    size_t open  = 0;
+    size_t close = 0;
+};
+
+size_t NextContentLine(const std::vector<TextLine>& lines,
+                       const std::string& text, size_t from, size_t to) {
+    while (from < to) {
+        const std::string trimmed = TrimText(LineText(text, lines[from]));
+        if (!trimmed.empty() && trimmed.compare(0, 2, "//") != 0) return from;
+        ++from;
+    }
+    return to;
+}
+
+size_t FindMatchingBrace(const std::vector<TextLine>& lines,
+                         const std::string& text, size_t open, size_t limit) {
+    if (open >= limit) return std::string::npos;
+    int depth = 0;
+    for (size_t i = open; i < limit; ++i) {
+        depth += BraceDelta(LineText(text, lines[i]));
+        if (depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+bool FindChildBlock(const std::vector<TextLine>& lines, const std::string& text,
+                    size_t from, size_t to, const std::string& key,
+                    VdfBlock* out) {
+    size_t i = from;
+    while (i < to) {
+        ParsedLine parsed;
+        if (ParseVdfLine(LineText(text, lines[i]), &parsed) && !parsed.hasValue) {
+            const size_t next = NextContentLine(lines, text, i + 1, to);
+            if (next < to && IsOpenBraceLine(LineText(text, lines[next]))) {
+                const size_t close = FindMatchingBrace(lines, text, next, to);
+                if (close == std::string::npos) return false;
+                if (parsed.key == key) {
+                    out->open  = next;
+                    out->close = close;
+                    return true;
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return false;
+}
+
+bool ReadDirectValue(const std::vector<TextLine>& lines, const std::string& text,
+                     const VdfBlock& block, const char* key, std::string* value) {
+    int depth = 0;
+    for (size_t i = block.open + 1; i < block.close; ++i) {
+        const std::string line = LineText(text, lines[i]);
+        if (depth == 0) {
+            ParsedLine parsed;
+            if (ParseVdfLine(line, &parsed) && parsed.hasValue &&
+                parsed.key == key) {
+                if (value) *value = UnescapeVdf(parsed.value);
+                return true;
+            }
+        }
+        depth += BraceDelta(line);
+    }
+    return false;
+}
+
+std::string ActiveSteamId(const std::string& root) {
+    const std::string text = ReadWholeFile(root + "\\config\\loginusers.vdf");
+    if (text.empty()) return std::string();
+
+    const std::vector<TextLine> lines = SplitTextLines(text);
+    VdfBlock users;
+    if (!FindChildBlock(lines, text, 0, lines.size(), "users", &users))
+        return std::string();
+
+    std::string bestId;
+    long long   bestTime = -1;
+    bool        bestAuto = false;
+
+    size_t i = users.open + 1;
+    while (i < users.close) {
+        ParsedLine parsed;
+        if (ParseVdfLine(LineText(text, lines[i]), &parsed) && !parsed.hasValue) {
+            const size_t next =
+                NextContentLine(lines, text, i + 1, users.close);
+            if (next < users.close &&
+                IsOpenBraceLine(LineText(text, lines[next]))) {
+                const size_t close =
+                    FindMatchingBrace(lines, text, next, users.close);
+                if (close == std::string::npos) break;
+
+                VdfBlock account;
+                account.open  = next;
+                account.close = close;
+
+                std::string autoText;
+                std::string timeText;
+                ReadDirectValue(lines, text, account, "AutoLogin", &autoText);
+                ReadDirectValue(lines, text, account, "timestamp", &timeText);
+
+                const long long stamp =
+                    timeText.empty() ? 0 : std::strtoll(timeText.c_str(), nullptr, 10);
+                const bool autoLogin = autoText == "1";
+
+                if (stamp > bestTime ||
+                    (stamp == bestTime && autoLogin && !bestAuto)) {
+                    bestTime = stamp;
+                    bestAuto = autoLogin;
+                    bestId   = parsed.key;
+                }
+
+                i = close + 1;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return bestId;
+}
+
+std::string NewestLocalConfig(const std::string& root) {
+    std::string      best;
+    ULONGLONG        bestTime = 0;
+    WIN32_FIND_DATAA findData{};
+    HANDLE handle = FindFirstFileA((root + "\\userdata\\*").c_str(), &findData);
+    if (handle == INVALID_HANDLE_VALUE) return best;
+
+    do {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+        if (std::strcmp(findData.cFileName, ".") == 0 ||
+            std::strcmp(findData.cFileName, "..") == 0)
+            continue;
+
+        const std::string path = root + "\\userdata\\" + findData.cFileName +
+                                 "\\config\\localconfig.vdf";
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &info))
+            continue;
+
+        ULARGE_INTEGER stamp{};
+        stamp.LowPart  = info.ftLastWriteTime.dwLowDateTime;
+        stamp.HighPart = info.ftLastWriteTime.dwHighDateTime;
+        if (stamp.QuadPart > bestTime) {
+            bestTime = stamp.QuadPart;
+            best     = path;
+        }
+    } while (FindNextFileA(handle, &findData));
+    FindClose(handle);
+    return best;
+}
+
+std::string FindSteamLocalConfig() {
+    for (const auto& root : SteamRoots()) {
+        const std::string id = ActiveSteamId(root);
+        if (!id.empty()) {
+            const std::string path =
+                root + "\\userdata\\" + id + "\\config\\localconfig.vdf";
+            if (FileExists(path)) return path;
+        }
+
+        const std::string newest = NewestLocalConfig(root);
+        if (!newest.empty()) return newest;
+    }
+    return std::string();
+}
+
+LaunchOptionsStatus ApplyLaunchOptionsFile(const std::string& path, bool write,
+                                          unsigned flags) {
+    LaunchOptionsStatus status;
+    status.path = path;
+
+    std::string text = ReadWholeFile(path);
+    if (text.empty()) {
+        status.detail = "steam localconfig not found";
+        return status;
+    }
+
+    const std::vector<TextLine> lines = SplitTextLines(text);
+    VdfBlock user;
+    VdfBlock software;
+    VdfBlock valve;
+    VdfBlock steam;
+    VdfBlock apps;
+    VdfBlock app;
+
+    if (!FindChildBlock(lines, text, 0, lines.size(), "UserLocalConfigStore",
+                        &user) ||
+        !FindChildBlock(lines, text, user.open + 1, user.close, "Software",
+                        &software) ||
+        !FindChildBlock(lines, text, software.open + 1, software.close, "Valve",
+                        &valve) ||
+        !FindChildBlock(lines, text, valve.open + 1, valve.close, "Steam",
+                        &steam) ||
+        !FindChildBlock(lines, text, steam.open + 1, steam.close, "apps",
+                        &apps) ||
+        !FindChildBlock(lines, text, apps.open + 1, apps.close, kSteamAppId,
+                        &app)) {
+        status.detail = "apex not found in steam config";
+        return status;
+    }
+
+    size_t     optionLine = std::string::npos;
+    ParsedLine option;
+    int        depth = 0;
+    for (size_t i = app.open + 1; i < app.close; ++i) {
+        const std::string line = LineText(text, lines[i]);
+        if (depth == 0) {
+            ParsedLine parsed;
+            if (ParseVdfLine(line, &parsed) && parsed.key == "LaunchOptions") {
+                optionLine = i;
+                option     = parsed;
+                break;
+            }
+        }
+        depth += BraceDelta(line);
+    }
+
+    const bool        wantMat  = (flags & kLaunchLetterbox) != 0;
+    const bool        wantExec = (flags & kLaunchAutoexec) != 0;
+    const std::string rawValue = option.hasValue ? option.value : std::string();
+    const bool        hasMat   = !wantMat || ContainsNoCase(rawValue, kMatLaunchArg);
+    const bool        hasExec  = !wantExec || ContainsNoCase(rawValue, kExecLaunchArg);
+
+    status.value = UnescapeVdf(rawValue);
+    if (hasMat && hasExec) {
+        status.ok             = true;
+        status.alreadyPresent = true;
+        status.detail         = "already set";
+        return status;
+    }
+
+    if (!write) {
+        status.detail = "steam running";
+        return status;
+    }
+
+    std::string nextValue = rawValue;
+    auto appendArg = [&nextValue](const char* arg) {
+        if (!nextValue.empty() && nextValue.back() != ' ' &&
+            nextValue.back() != '\t')
+            nextValue += ' ';
+        nextValue += arg;
+    };
+    if (!hasMat) appendArg(kMatLaunchArg);
+    if (!hasExec) appendArg(kExecLaunchArg);
+
+    if (optionLine != std::string::npos) {
+        if (option.hasValue) {
+            text.replace(lines[optionLine].start + option.valueOpen + 1,
+                         option.valueClose - option.valueOpen - 1, nextValue);
+        } else {
+            std::string indent;
+            for (char c : LineText(text, lines[optionLine])) {
+                if (c == ' ' || c == '\t')
+                    indent += c;
+                else
+                    break;
+            }
+            text.replace(lines[optionLine].start,
+                         lines[optionLine].end - lines[optionLine].start,
+                         indent + "\"LaunchOptions\"\t\t\"" + nextValue + "\"");
+        }
+    } else {
+        std::string indent;
+        for (char c : LineText(text, lines[app.close])) {
+            if (c == ' ' || c == '\t')
+                indent += c;
+            else
+                break;
+        }
+        indent += '\t';
+        const std::string eol =
+            text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+        text.insert(lines[app.close].start,
+                    indent + "\"LaunchOptions\"\t\t\"" + nextValue + "\"" + eol);
+    }
+
+    const std::string backup = path + ".apex.bak";
+    if (!CopyFileA(path.c_str(), backup.c_str(), FALSE)) {
+        status.detail = "could not back up steam config";
+        return status;
+    }
+
+    const std::string temp = path + ".apextmp";
+    std::ofstream out(temp.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out) {
+        DeleteFileA(temp.c_str());
+        status.detail = "could not write steam config";
+        return status;
+    }
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.close();
+    if (!out) {
+        DeleteFileA(temp.c_str());
+        status.detail = "could not write steam config";
+        return status;
+    }
+
+    if (!MoveFileExA(temp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temp.c_str());
+        status.detail = "could not save steam config";
+        return status;
+    }
+
+    status.ok      = true;
+    status.changed = true;
+    status.value   = UnescapeVdf(nextValue);
+    status.detail  = "launch options updated";
+    return status;
+}
+
 std::string FindGameFolder() {
     for (const auto& root : SteamRoots()) {
         const std::string candidate = root + "\\steamapps\\common\\Apex Legends";
@@ -411,6 +884,30 @@ Report SnapshotAutoexec() {
 
 bool AutoexecInstalled() {
     return FileExists(SteamCfgDir() + "\\autoexec.cfg");
+}
+
+LaunchOptionsStatus UpdateLaunchOptionsFile(const std::string& path, unsigned flags) {
+    return ApplyLaunchOptionsFile(path, true, flags);
+}
+
+LaunchOptionsStatus EnsureLaunchOptions(unsigned flags) {
+    LaunchOptionsStatus status;
+    const std::string   path = FindSteamLocalConfig();
+    if (path.empty()) {
+        status.detail = "steam localconfig not found";
+        return status;
+    }
+
+    const bool running = SteamRunning();
+    status             = ApplyLaunchOptionsFile(path, !running, flags);
+    status.steamRunning = running;
+    if (!status.ok && running && status.detail == "steam running")
+        status.detail = "close steam, then click again";
+    return status;
+}
+
+LaunchOptionsStatus EnsureAutoexecLaunchOption() {
+    return EnsureLaunchOptions(kLaunchAutoexec);
 }
 
 }
