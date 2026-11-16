@@ -7,7 +7,8 @@ namespace Glass {
 
 class Backdrop {
 public:
-    bool Init(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND overlay_hwnd);
+    bool Init(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND overlay_hwnd,
+              bool with_desktop = true);
     void Shutdown();
     void Capture();
     ID3D11ShaderResourceView* heavySRV() const { return heavy_.srv; }

@@ -23,12 +23,17 @@ public:
     int  DisplayCount() const { return static_cast<int>(displays_.size()); }
     const std::string& Error() const { return error_; }
 
-    bool Apply(float brightness, float contrast, float gamma);
-    bool Reset();
+    bool Apply(float brightness, float contrast, float gamma,
+               const std::string& device = std::string());
+    bool Reset(const std::string& device = std::string());
 
-    bool Matches(float brightness, float contrast, float gamma) const;
+    bool Matches(float brightness, float contrast, float gamma,
+                 const std::string& device = std::string()) const;
 
-    bool WriteRamp(const GammaRamp& ramp);
+    bool WriteRamp(const GammaRamp& ramp,
+                   const std::string& device = std::string());
+
+    std::string DeviceName(int index) const;
 
     static void BuildRamp(float brightness, float contrast, float gamma, GammaRamp& out);
 
@@ -42,6 +47,9 @@ private:
         GammaRamp   factory;
         bool        hasFactory = false;
     };
+
+    Entry*       FindEntry(const std::string& device);
+    const Entry* FindEntry(const std::string& device) const;
 
     std::vector<Entry> displays_;
     std::string        error_;

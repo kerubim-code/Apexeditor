@@ -901,6 +901,9 @@ void Toggle() {
 }
 
 void Show(bool on) {
+    // Create the overlay lazily the first time it is actually needed.
+    if (on && g_hwnd == nullptr && !Create())
+        return;
     g_on = on;
     settings::SetBool("overlay_on", on);
     if (g_hwnd == nullptr)

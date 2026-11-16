@@ -241,6 +241,7 @@ extern ImVec2      g_uiBlurOrigin;
 extern ImVec2      g_uiBlurSize;
 
 bool DrawUIBlurPanel(ImDrawList* dl, ImVec2 pmin, ImVec2 pmax, float rounding, float alpha, ImU32 tint);
+bool ConsumeUIBlurRequest();
 
 bool BeginCard(const char* id, Material m = Material::Regular, ImVec2 size = ImVec2(0,0));
 void EndCard();

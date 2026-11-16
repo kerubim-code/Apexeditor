@@ -44,7 +44,7 @@ if errorlevel 1 exit /b 1
 cl %COMMON% %LIQUID_INC% ^
     client\main.cpp client\app.cpp client\sections.cpp client\logo.cpp ^
     client\videocfg.cpp client\spotify.cpp client\crosshair.cpp client\overlay.cpp ^
-    client\color\adl_backend.cpp client\color\gamma.cpp client\color\vibrance.cpp ^
+    client\color\adl_backend.cpp client\color\gamma.cpp client\color\nvidia_backend.cpp client\color\vibrance.cpp ^
     %GLASS_SRC% %LIQUID_IMGUI_SRC% ^
     build\client\app.res ^
     /Fo:build\client\ /Fe:dist\APEXClient.exe %LIBS% %GLASS_LIBS%

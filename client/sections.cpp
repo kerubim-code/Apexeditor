@@ -1823,21 +1823,74 @@ void App::DrawCustom() {
     Glass::EndPanel();
 }
 
+bool MonitorCard(const char* id, const std::string& label,
+                 const std::string& detail, bool selected,
+                 const ImVec2& size) {
+    ImGui::PushID(id);
+    const ImVec2 cur = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##card", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool clicked = ImGui::IsItemDeactivated() && hovered;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 max(cur.x + size.x, cur.y + size.y);
+    const float  rounding = 13.0f;
+
+    dl->AddRectFilled(cur, max,
+                      selected ? IM_COL32(104, 134, 246, 62)
+                               : IM_COL32(255, 255, 255, hovered ? 26 : 14),
+                      rounding);
+    dl->AddRect(cur, max,
+                selected ? IM_COL32(150, 174, 255, 220)
+                         : IM_COL32(255, 255, 255, 40),
+                rounding, 0, selected ? 1.6f : 1.0f);
+
+    const float iconX = cur.x + 27.0f;
+    const float iconY = cur.y + size.y * 0.5f;
+    Glass::DrawIcon(dl, Glass::Icon::Display, ImVec2(iconX, iconY), 23.0f,
+                    selected ? IM_COL32(255, 255, 255, 255) : kDim, 1.9f);
+
+    dl->AddText(ImVec2(cur.x + 49.0f, cur.y + 11.0f), kInk, label.c_str());
+    if (!detail.empty())
+        dl->AddText(ImVec2(cur.x + 49.0f, cur.y + 31.0f), kDim, detail.c_str());
+
+    if (selected && size.x > 122.0f) {
+        Glass::DrawIcon(dl, Glass::Icon::CheckCircle,
+                        ImVec2(max.x - 19.0f, cur.y + 19.0f), 13.0f,
+                        IM_COL32(206, 219, 255, 255), 1.7f);
+    }
+
+    ImGui::PopID();
+    return clicked;
+}
+
+bool SliderReset(const char* id) {
+    ImGui::SameLine(0.0f, 5.0f);
+    const bool clicked = Glass::IconButton(id, Glass::Icon::Refresh, 24.0f);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("reset to unity");
+    return clicked;
+}
+
 void App::DrawColor() {
     auto& engine = color::VibranceEngine::Get();
 
     const std::string frontApp = engine.ForegroundApp();
 
-    const bool adlReady   = engine.AdlReady();
-    const bool gammaReady = engine.GammaReady();
+    const bool adlReady    = engine.AdlReady();
+    const bool nvidiaReady = engine.NvidiaReady();
+    const bool gammaReady  = engine.GammaReady();
 
     const char* pillText = "no colour backend available";
     ImU32       pillTone = kWarn;
-    if (engine.Running() && adlReady) {
+    if (engine.Running() && nvidiaReady) {
+        pillText = "NVIDIA colour backend ready";
+        pillTone = kOk;
+    } else if (engine.Running() && adlReady) {
         pillText = "AMD colour backend ready";
         pillTone = kOk;
     } else if (engine.Running() && gammaReady) {
-        pillText = "AMD driver unreachable - gamma fallback";
+        pillText = "GPU driver unreachable - gamma fallback";
         pillTone = kWarn;
     } else if (!engine.Running()) {
         pillText = "colour engine stopped";
@@ -1870,58 +1923,118 @@ void App::DrawColor() {
     if (enabled) {
         ImGui::PushID("screen_profile");
 
+        const std::vector<color::MonitorInfo> monitors = engine.Monitors();
+        const int selectedMonitor = engine.SelectedMonitor();
+
+        if (!monitors.empty()) {
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const float gap   = 8.0f;
+            const int   count = 1 + static_cast<int>(monitors.size());
+            float cardW = (avail - gap * static_cast<float>(count - 1)) /
+                          static_cast<float>(count);
+            cardW = std::min(190.0f, std::max(104.0f, cardW));
+            const ImVec2 cardSize(cardW, 58.0f);
+
+            if (MonitorCard("all_screens", "all screens", "every display",
+                            selectedMonitor < 0, cardSize))
+                engine.SetSelectedMonitor(-1);
+
+            for (size_t i = 0; i < monitors.size(); ++i) {
+                char id[24];
+                snprintf(id, sizeof(id), "screen_card_%d", static_cast<int>(i));
+                char detail[32];
+                if (monitors[i].width > 0 && monitors[i].height > 0)
+                    snprintf(detail, sizeof(detail), "%d x %d",
+                             monitors[i].width, monitors[i].height);
+                else
+                    detail[0] = '\0';
+
+                ImGui::SameLine(0.0f, gap);
+                if (MonitorCard(id, monitors[i].label, detail,
+                                selectedMonitor == static_cast<int>(i), cardSize))
+                    engine.SetSelectedMonitor(static_cast<int>(i));
+            }
+
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+            if (selectedMonitor >= 0 &&
+                selectedMonitor < static_cast<int>(monitors.size()))
+                ImGui::TextWrapped(
+                    "colour values are applied only to %s. The other monitors "
+                    "stay at their original levels.",
+                    monitors[selectedMonitor].label.c_str());
+            else
+                ImGui::TextWrapped(
+                    "colour values are applied to every detected screen. Pick a "
+                    "screen card to isolate one monitor.");
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        }
+
         float saturation = static_cast<float>(engine.DesktopSaturation());
         const float satBefore = saturation;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("saturation", &saturation, 0.0f, 300.0f, "%.0f");
         if (saturation != satBefore)
             engine.SetDesktopSaturation(static_cast<int>(saturation + 0.5f));
+        if (SliderReset("reset_saturation"))
+            engine.SetDesktopSaturation(color::VibranceEngine::kSaturationDefault);
 
         float hue = static_cast<float>(engine.Hue());
         const float hueBefore = hue;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("hue", &hue, 0.0f, 300.0f, "%.0f");
         if (hue != hueBefore)
             engine.SetHue(static_cast<int>(hue + 0.5f));
+        if (SliderReset("reset_hue"))
+            engine.SetHue(color::VibranceEngine::kSaturationDefault);
 
         float temperature = static_cast<float>(engine.Temperature());
         const float tempBefore = temperature;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("temperature", &temperature, 0.0f, 300.0f, "%.0f");
         if (temperature != tempBefore)
             engine.SetTemperature(static_cast<int>(temperature + 0.5f));
+        if (SliderReset("reset_temperature"))
+            engine.SetTemperature(color::VibranceEngine::kSaturationDefault);
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
 
         float brightness = engine.Brightness();
         const float briBefore = brightness;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("brightness", &brightness, 0.50f, 1.50f, "%.2f");
         if (brightness != briBefore) engine.SetBrightness(brightness);
+        if (SliderReset("reset_brightness")) engine.SetBrightness(1.0f);
 
         float contrast = engine.Contrast();
         const float conBefore = contrast;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("contrast", &contrast, 0.50f, 1.50f, "%.2f");
         if (contrast != conBefore) engine.SetContrast(contrast);
+        if (SliderReset("reset_contrast")) engine.SetContrast(1.0f);
 
         float gamma = engine.Gamma();
         const float gamBefore = gamma;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.0f);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 210.0f);
         Glass::Slider("gamma", &gamma, 0.50f, 2.00f, "%.2f");
         if (gamma != gamBefore) engine.SetGamma(gamma);
+        if (SliderReset("reset_gamma")) engine.SetGamma(1.0f);
 
         ImGui::Dummy(ImVec2(0.0f, 12.0f));
 
-        if (Glass::Button("reset to defaults", false,
+        if (Glass::Button("reset every value to unity", false,
                           ImVec2(ImGui::GetContentRegionAvail().x, 44.0f))) {
-            engine.SetBrightness(1.0f);
-            engine.SetContrast(1.0f);
-            engine.SetGamma(1.0f);
-            engine.SetHue(color::VibranceEngine::kSaturationDefault);
-            engine.SetTemperature(color::VibranceEngine::kSaturationDefault);
-            engine.SetDesktopSaturation(color::VibranceEngine::kSaturationDefault);
+            engine.ResetToUnity();
+            Toast(Glass::Icon::CheckCircle, kOk, "reset to unity",
+                  "brightness, contrast, gamma and colour values are back to neutral.");
         }
+
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextWrapped(
+            "tip: the refresh icon next to a value resets that single value to "
+            "unity (1.00 or 100).");
+        ImGui::PopStyleColor();
 
         ImGui::PopID();
     }
@@ -2379,8 +2492,10 @@ void App::DrawConfig() {
     } else if (Glass::Button("start the colour engine now", true,
                              ImVec2(engineW, 44.0f))) {
         engine.Start();
-        Toast(Glass::Icon::CheckCircle, kOk, "colour engine",
-              engine.AdlReady() ? "AMD backend ready" : "gamma fallback active");
+        const char* backend = engine.NvidiaReady() ? "NVIDIA backend ready"
+                              : engine.AdlReady() ? "AMD backend ready"
+                                                  : "gamma fallback active";
+        Toast(Glass::Icon::CheckCircle, kOk, "colour engine", backend);
     }
 
     Glass::EndPanel();
@@ -3256,6 +3371,9 @@ void App::DrawCrosshair() {
 }
 
 void App::DrawOverlay() {
+    if (overlay::Window() == nullptr)
+        overlay::Create();
+
     char count[16];
     snprintf(count, sizeof(count), "%d", overlay::Count());
     int rw = 0, rh = 0;

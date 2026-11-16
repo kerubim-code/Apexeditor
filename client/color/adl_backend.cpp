@@ -16,6 +16,9 @@ namespace apex::color {
 
 namespace {
 
+constexpr int kDisplayConnected = 0x00000001;
+constexpr int kDisplayMapped    = 0x00000002;
+
 void* AdlMemoryAlloc(int size) {
     if (size <= 0) return nullptr;
     return CoTaskMemAlloc(static_cast<SIZE_T>(size));
@@ -111,9 +114,12 @@ bool AdlBackend::Init() {
 
     for (const auto& adapter : adapters) {
         int active = 0;
-        if (adapterActive_ != nullptr &&
-            adapterActive_(adapter.adapterIndex, &active) != kAdlSuccess)
-            continue;
+        if (adapterActive_ != nullptr) {
+            if (adapterActive_(adapter.adapterIndex, &active) != kAdlSuccess)
+                continue;
+            if (active == 0)
+                continue;
+        }
 
         int         displayCount = 0;
         void*       buffer       = nullptr;
@@ -124,6 +130,18 @@ bool AdlBackend::Init() {
         const auto* infos = static_cast<const AdlDisplayInfo*>(buffer);
         for (int i = 0; i < displayCount; ++i) {
             if (infos[i].displayID.logicalAdapterIndex == -1) continue;
+
+            // Keep only displays that are actually connected to, and mapped on,
+            // an active adapter. Without this filter ADL reports inactive
+            // outputs too, which makes screen numbering ambiguous.
+            if (infos[i].displayInfoMask != 0) {
+                if ((infos[i].displayInfoMask & kDisplayConnected) &&
+                    !(infos[i].displayInfoValue & kDisplayConnected))
+                    continue;
+                if ((infos[i].displayInfoMask & kDisplayMapped) &&
+                    !(infos[i].displayInfoValue & kDisplayMapped))
+                    continue;
+            }
 
             DisplayTarget target;
             target.adapterIndex = adapter.adapterIndex;
@@ -186,6 +204,7 @@ void AdlBackend::Shutdown() {
         module_ = nullptr;
     }
     ready_ = false;
+    attempted_ = false;
     displays_.clear();
 }
 
@@ -250,9 +269,19 @@ int AdlBackend::MapSaturation(const DisplayTarget& target, int appValue) {
 }
 
 bool AdlBackend::SetSaturationOnAll(int appValue) const {
+    return SetSaturation(appValue, -1);
+}
+
+bool AdlBackend::SetSaturation(int appValue, int onlyDisplay) const {
     const auto targets = Displays();
+    if (onlyDisplay >= static_cast<int>(targets.size()))
+        return false;
+
     bool any = false;
-    for (const auto& target : targets) {
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (onlyDisplay >= 0 && static_cast<int>(i) != onlyDisplay)
+            continue;
+        const auto& target = targets[i];
         if (!target.saturationKnown)
             continue;
         const int mapped = MapSaturation(target, appValue);
@@ -273,9 +302,19 @@ bool AdlBackend::RestoreSaturation() const {
 }
 
 bool AdlBackend::SetColorOnAll(int flag, int appValue) const {
+    return SetColorOnTargets(flag, appValue, -1);
+}
+
+bool AdlBackend::SetColorOnTargets(int flag, int appValue, int onlyDisplay) const {
     const auto targets = Displays();
+    if (onlyDisplay >= static_cast<int>(targets.size()))
+        return false;
+
     bool any = false;
-    for (const auto& target : targets) {
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (onlyDisplay >= 0 && static_cast<int>(i) != onlyDisplay)
+            continue;
+        const auto& target = targets[i];
         ColorValue current;
         if (!GetColor(target, flag, current) || !current.settable)
             continue;

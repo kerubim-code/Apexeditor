@@ -20,7 +20,16 @@ ImTextureID g_uiBlurTex   = 0;
 ImVec2      g_uiBlurOrigin = ImVec2(0.0f, 0.0f);
 ImVec2      g_uiBlurSize   = ImVec2(1.0f, 1.0f);
 
+static bool g_uiBlurRequested = false;
+
+bool ConsumeUIBlurRequest() {
+    const bool requested = g_uiBlurRequested;
+    g_uiBlurRequested = false;
+    return requested;
+}
+
 bool DrawUIBlurPanel(ImDrawList* dl, ImVec2 pmin, ImVec2 pmax, float rounding, float alpha, ImU32 tint) {
+    g_uiBlurRequested = true;
     if (!g_uiBlurTex) return false;
     if (alpha < 0.0f) alpha = 0.0f; else if (alpha > 1.0f) alpha = 1.0f;
     const float iw = g_uiBlurSize.x > 1.0f ? g_uiBlurSize.x : 1.0f;

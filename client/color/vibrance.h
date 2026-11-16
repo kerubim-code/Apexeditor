@@ -21,6 +21,16 @@ struct AppRule {
     float gamma      = 1.0f;
 };
 
+struct MonitorInfo {
+    int         index   = 0;
+    std::string label;          // "screen 1"
+    std::string name;           // monitor / adapter friendly name
+    std::string device;         // \\.\DISPLAY1
+    int         width   = 0;
+    int         height  = 0;
+    bool        primary = false;
+};
+
 bool SameApp(const std::string& a, const std::string& b);
 
 class VibranceEngine {
@@ -31,6 +41,7 @@ public:
     void Stop();
 
     bool AdlReady() const;
+    bool NvidiaReady() const;
     bool GammaReady() const;
     bool Running() const;
     std::string BackendInfo() const;
@@ -58,6 +69,11 @@ public:
 
     bool   HueAvailable() const;
     bool   TemperatureAvailable() const;
+
+    std::vector<MonitorInfo> Monitors() const;
+    int    SelectedMonitor() const;
+    void   SetSelectedMonitor(int index);
+    void   ResetToUnity();
 
     std::vector<AppRule> Rules() const;
     void   SetRules(const std::vector<AppRule>& rules);
@@ -90,6 +106,12 @@ private:
     void   ApplySaturation(int value, bool force);
     void   ApplyExtraColor(int flag, int value, bool force);
 
+    void   RefreshMonitorsLocked();
+    void   RefreshMonitorsIfChanged();
+    void   RestoreAllTargetsLocked();
+    std::string GammaDeviceForLocked(int monitor) const;
+    int    AdlDisplayForLocked(int monitor) const;
+
     void   MarkDirtyLocked();
     void   FlushDirty() const;
 
@@ -108,6 +130,12 @@ private:
 
     std::string foreground_;
     int         appliedSat_ = kSaturationDefault;
+
+    std::vector<MonitorInfo> monitors_;
+    int  selectedMonitor_   = -1;   // -1 = every screen
+    bool selectionChanged_  = false;
+    bool disabledRestored_  = false;
+    uint64_t lastMonitorScan_ = 0;
 
     int         satCache_      = kSaturationDefault;
     bool        satCacheValid_ = false;

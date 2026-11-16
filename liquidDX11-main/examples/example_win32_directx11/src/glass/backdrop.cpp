@@ -11,7 +11,8 @@
 
 namespace Glass {
 
-bool Backdrop::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND hwnd) {
+bool Backdrop::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND hwnd,
+                    bool with_desktop) {
     dev_ = device; ctx_ = ctx; hwnd_ = hwnd;
 
     if (!CompileBlurShaders()) { Shutdown(); return false; }
@@ -34,15 +35,28 @@ bool Backdrop::Init(ID3D11Device* device, ID3D11DeviceContext* ctx, HWND hwnd) {
     { D3D11_DEPTH_STENCIL_DESC dd = {};
       dd.DepthEnable = FALSE; dd.StencilEnable = FALSE;
       if (FAILED(dev_->CreateDepthStencilState(&dd, &depth_off_))) { Shutdown(); return false; } }
-    CreateDuplication();
-    if (!up_[0].srv) {
+
+    // The desktop capture chain is only needed when the translucent backdrop or
+    // the Spotify player overlay is actually used.  Everything else (UI blur)
+    // works with the shaders/states above and allocates its own scratch chain
+    // lazily in BlurUI().
+    if (with_desktop) {
+        CreateDuplication();
+        if (!up_[0].srv) {
+            int W = ::GetSystemMetrics(SM_CXSCREEN);
+            int H = ::GetSystemMetrics(SM_CYSCREEN);
+            if (W <= 0) W = 1920; if (H <= 0) H = 1080;
+            out_x_ = 0; out_y_ = 0;
+            CreateChain(W, H);
+        }
+        for (int i = 0; i < 8 && !have_first_; ++i) Capture();
+    } else {
+        // Keep shader coordinates sane while no desktop texture exists.
         int W = ::GetSystemMetrics(SM_CXSCREEN);
         int H = ::GetSystemMetrics(SM_CYSCREEN);
         if (W <= 0) W = 1920; if (H <= 0) H = 1080;
-        out_x_ = 0; out_y_ = 0;
-        CreateChain(W, H);
+        out_x_ = 0; out_y_ = 0; out_w_ = W; out_h_ = H;
     }
-    for (int i = 0; i < 8 && !have_first_; ++i) Capture();
     return true;
 }
 

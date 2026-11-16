@@ -101,17 +101,18 @@ void GammaBackend::Shutdown() {
     ready_ = false;
 }
 
-bool GammaBackend::Apply(float brightness, float contrast, float gamma) {
+bool GammaBackend::Apply(float brightness, float contrast, float gamma,
+                         const std::string& device) {
     if (!ready_) return false;
 
     if (std::fabs(brightness - 1.0f) < kEpsilon &&
         std::fabs(contrast - 1.0f) < kEpsilon &&
         std::fabs(gamma - 1.0f) < kEpsilon)
-        return Reset();
+        return Reset(device);
 
     GammaRamp ramp;
     BuildRamp(brightness, contrast, gamma, ramp);
-    return WriteRamp(ramp);
+    return WriteRamp(ramp, device);
 }
 
 void GammaBackend::BuildRamp(float brightness, float contrast, float gamma, GammaRamp& out) {
@@ -136,36 +137,52 @@ void GammaBackend::BuildRamp(float brightness, float contrast, float gamma, Gamm
     out = ramp;
 }
 
-bool GammaBackend::Matches(float brightness, float contrast, float gamma) const {
+bool GammaBackend::Matches(float brightness, float contrast, float gamma,
+                           const std::string& device) const {
     if (!ready_) return false;
 
     const bool neutral = std::fabs(brightness - 1.0f) < kEpsilon &&
                          std::fabs(contrast - 1.0f) < kEpsilon &&
                          std::fabs(gamma - 1.0f) < kEpsilon;
 
-    GammaRamp target;
-    if (neutral) {
+    const Entry* only = device.empty() ? nullptr : FindEntry(device);
+    if (!device.empty() && only == nullptr)
+        return true;
 
-        for (const auto& entry : displays_)
-            if (entry.hasFactory) { target = entry.factory; break; }
-    } else {
+    GammaRamp target;
+    if (!neutral)
         BuildRamp(brightness, contrast, gamma, target);
-    }
 
     for (const auto& entry : displays_) {
+        if (only != nullptr && &entry != only)
+            continue;
+        if (entry.dc == nullptr)
+            continue;
+
         GammaRamp current;
-        if (entry.dc == nullptr) continue;
-        if (!GetDeviceGammaRamp(static_cast<HDC>(entry.dc), &current)) return false;
-        if (memcmp(&current, &target, sizeof(GammaRamp)) != 0) return false;
+        if (!GetDeviceGammaRamp(static_cast<HDC>(entry.dc), &current))
+            return false;
+
+        const GammaRamp& expected = neutral ? entry.factory : target;
+        if (neutral && !entry.hasFactory)
+            continue;
+        if (memcmp(&current, &expected, sizeof(GammaRamp)) != 0)
+            return false;
     }
     return true;
 }
 
-bool GammaBackend::Reset() {
+bool GammaBackend::Reset(const std::string& device) {
     if (!ready_) return false;
+
+    Entry* only = device.empty() ? nullptr : FindEntry(device);
+    if (!device.empty() && only == nullptr)
+        return true;
 
     bool ok = true;
     for (auto& entry : displays_) {
+        if (only != nullptr && &entry != only)
+            continue;
         if (!entry.hasFactory) continue;
         if (!SetDeviceGammaRamp(static_cast<HDC>(entry.dc), &entry.factory))
             ok = false;
@@ -173,17 +190,43 @@ bool GammaBackend::Reset() {
     return ok;
 }
 
-bool GammaBackend::WriteRamp(const GammaRamp& ramp) {
+bool GammaBackend::WriteRamp(const GammaRamp& ramp, const std::string& device) {
     if (!ready_) return false;
+
+    Entry* only = device.empty() ? nullptr : FindEntry(device);
+    if (!device.empty() && only == nullptr)
+        return false;
 
     void* buffer = const_cast<GammaRamp*>(&ramp);
 
     bool ok = false;
     for (auto& entry : displays_) {
+        if (only != nullptr && &entry != only)
+            continue;
         if (SetDeviceGammaRamp(static_cast<HDC>(entry.dc), buffer))
             ok = true;
     }
     return ok;
+}
+
+std::string GammaBackend::DeviceName(int index) const {
+    if (index < 0 || index >= static_cast<int>(displays_.size()))
+        return std::string();
+    return displays_[index].device;
+}
+
+GammaBackend::Entry* GammaBackend::FindEntry(const std::string& device) {
+    for (auto& entry : displays_)
+        if (entry.device == device)
+            return &entry;
+    return nullptr;
+}
+
+const GammaBackend::Entry* GammaBackend::FindEntry(const std::string& device) const {
+    for (const auto& entry : displays_)
+        if (entry.device == device)
+            return &entry;
+    return nullptr;
 }
 
 }

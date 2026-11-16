@@ -107,6 +107,10 @@ public:
     bool SetSaturationOnAll(int appValue) const;
     bool SetColorOnAll(int flag, int appValue) const;
 
+    // onlyDisplay is an index into Displays(); -1 targets every display.
+    bool SetSaturation(int appValue, int onlyDisplay) const;
+    bool SetColorOnTargets(int flag, int appValue, int onlyDisplay) const;
+
     bool RestoreSaturation() const;
     bool RestoreColorOnAll(int flag) const;
 

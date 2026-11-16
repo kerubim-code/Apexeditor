@@ -21,6 +21,7 @@
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <windowsx.h>
 
 #include <cmath>
@@ -38,6 +39,70 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
                                                              LPARAM lParam);
 
 namespace {
+
+// Frame pacing ---------------------------------------------------------------
+// The application used to rely on vsync alone, which meant it rendered at the
+// monitor refresh rate (often 144/165 Hz) even though the UI only needs a
+// fraction of that.  Sleeping on a high-resolution waitable timer lets us cap
+// the loop without changing what is on screen: Present() still uses vsync, so
+// the pacing only decides how often a new frame is submitted.
+class FramePacer {
+public:
+    void Init() {
+        QueryPerformanceFrequency(&freq_);
+        QueryPerformanceCounter(&next_);
+        timer_ = CreateWaitableTimerExW(nullptr, nullptr,
+                                        kTimerHighResolution, kTimerAllAccess);
+    }
+
+    void Shutdown() {
+        if (timer_ != nullptr) {
+            CloseHandle(timer_);
+            timer_ = nullptr;
+        }
+    }
+
+    void Wait(double fps) {
+        if (fps <= 1.0 || freq_.QuadPart == 0)
+            return;
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+
+        const LONGLONG period = static_cast<LONGLONG>(
+            static_cast<double>(freq_.QuadPart) / fps);
+        next_.QuadPart += period;
+        if (now.QuadPart >= next_.QuadPart) {
+            // Resynchronise after a long stall (minimise, resize, sleep...).
+            if (now.QuadPart - next_.QuadPart > freq_.QuadPart)
+                next_ = now;
+            return;
+        }
+
+        const double remainingMs =
+            static_cast<double>(next_.QuadPart - now.QuadPart) * 1000.0 /
+            static_cast<double>(freq_.QuadPart);
+
+        if (timer_ != nullptr) {
+            // A relative due time is expressed in negative 100 ns units.
+            LARGE_INTEGER due{};
+            due.QuadPart = -static_cast<LONGLONG>(remainingMs * 10000.0);
+            if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE))
+                WaitForSingleObject(timer_,
+                                    static_cast<DWORD>(remainingMs + 4.0));
+        } else if (remainingMs > 2.0) {
+            Sleep(static_cast<DWORD>(remainingMs - 1.0));
+        }
+    }
+
+private:
+    static constexpr DWORD kTimerHighResolution = 0x00000002;
+    static constexpr DWORD kTimerAllAccess      = 0x001F0003;
+
+    HANDLE        timer_ = nullptr;
+    LARGE_INTEGER freq_{};
+    LARGE_INTEGER next_{};
+};
 
 ID3D11Device*           g_device        = nullptr;
 ID3D11DeviceContext*    g_context       = nullptr;
@@ -63,6 +128,7 @@ POINT            g_ovrDragPt{};
 
 Glass::Backdrop         g_backdrop;
 Glass::Renderer         g_renderer;
+FramePacer              g_pacer;
 
 // Solid black source for the glass shader when gui transparency is off: every
 // surface keeps the liquid glass reflections but samples black instead of the
@@ -107,6 +173,92 @@ void ReleaseBlackSRV() {
 
 constexpr int kWindowW = 1240;
 constexpr int kWindowH = 780;
+
+// Tray -----------------------------------------------------------------------
+// Minimising the main card parks the app in the notification area.  The tray
+// icon is only present while the window is hidden so the notification area
+// stays clean during normal use.
+constexpr UINT kTrayCallback      = WM_APP + 101;
+constexpr UINT kTrayMenuRestore   = 0x6101;
+constexpr UINT kTrayMenuExit      = 0x6102;
+
+NOTIFYICONDATAW g_trayData{};
+bool            g_trayAdded  = false;
+bool            g_trayHidden = false;
+HICON           g_trayIcon   = nullptr;
+UINT            g_taskbarCreated = 0;
+
+bool EnsureTrayIcon(HWND hwnd) {
+    if (g_trayAdded) return true;
+
+    NOTIFYICONDATAW data{};
+    data.cbSize          = sizeof(data);
+    data.hWnd            = hwnd;
+    data.uID             = 1;
+    data.uFlags          = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = kTrayCallback;
+    data.hIcon           = g_trayIcon != nullptr
+                               ? g_trayIcon
+                               : LoadIconW(nullptr, IDI_APPLICATION);
+    lstrcpynW(data.szTip, L"APEX ALL IN ONE", ARRAYSIZE(data.szTip));
+
+    if (!Shell_NotifyIconW(NIM_ADD, &data))
+        return false;
+
+    g_trayData  = data;
+    g_trayAdded = true;
+    return true;
+}
+
+void RemoveTrayIcon() {
+    if (!g_trayAdded) return;
+    g_trayData.uFlags = 0;
+    Shell_NotifyIconW(NIM_DELETE, &g_trayData);
+    g_trayAdded = false;
+}
+
+bool HideToTray(HWND hwnd) {
+    if (g_trayHidden) return true;
+    if (!EnsureTrayIcon(hwnd)) return false;
+
+    g_trayHidden = true;
+    ShowWindow(hwnd, SW_HIDE);
+    return true;
+}
+
+void RestoreFromTray(HWND hwnd) {
+    if (!g_trayHidden) return;
+
+    g_trayHidden = false;
+    RemoveTrayIcon();
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+void ShowTrayMenu(HWND hwnd) {
+    POINT pt{};
+    if (!GetCursorPos(&pt)) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) return;
+
+    AppendMenuW(menu, MF_STRING, kTrayMenuRestore, L"Restore APEX");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayMenuExit, L"Exit APEX");
+
+    SetForegroundWindow(hwnd);
+    const UINT command = TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+
+    if (command == kTrayMenuRestore)
+        RestoreFromTray(hwnd);
+    else if (command == kTrayMenuExit)
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
 
 }
 
@@ -348,7 +500,25 @@ ImFont* AddIconFont(ImFontAtlas* atlas, const char* rel, int resId, float size) 
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
+    if (g_taskbarCreated != 0 && msg == g_taskbarCreated) {
+        if (g_trayHidden)
+            EnsureTrayIcon(hWnd);
+        return 0;
+    }
+
     switch (msg) {
+        case kTrayCallback: {
+            const UINT event = static_cast<UINT>(lParam);
+            if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK) {
+                RestoreFromTray(hWnd);
+                return 0;
+            }
+            if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
+                ShowTrayMenu(hWnd);
+                return 0;
+            }
+            return 0;
+        }
         case WM_NCHITTEST: {
             POINT p = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ScreenToClient(hWnd, &p);
@@ -395,14 +565,27 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
         case WM_SIZE:
-            if (wParam == SIZE_MINIMIZED)
+            if (wParam == SIZE_MINIMIZED) {
+                HideToTray(hWnd);
                 return 0;
+            }
+            if (g_trayHidden) {
+                // Restored by Windows or another tool rather than through the
+                // tray icon: drop the icon and resume normal rendering.
+                g_trayHidden = false;
+                RemoveTrayIcon();
+            }
             g_resizeW = LOWORD(lParam);
             g_resizeH = HIWORD(lParam);
             return 0;
         case WM_SYSCOMMAND:
             if ((wParam & 0xfff0) == SC_KEYMENU)
                 return 0;
+            if ((wParam & 0xfff0) == SC_MINIMIZE) {
+                if (HideToTray(hWnd))
+                    return 0;
+                break;
+            }
             break;
         case WM_KEYDOWN:
             if (wParam == VK_ESCAPE) {
@@ -411,6 +594,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         case WM_DESTROY:
+            RemoveTrayIcon();
             ::PostQuitMessage(0);
             return 0;
     }
@@ -692,7 +876,8 @@ void RenderOverlayFrame(apex::App& app, bool allowShow) {
     vp.Height   = static_cast<float>(oh);
     vp.MaxDepth = 1.0f;
     g_context->RSSetViewports(1, &vp);
-    g_ovrRenderer.Render(g_backdrop.heavySRV(), g_backdrop.softSRV());
+    g_ovrRenderer.Render(g_backdrop.ok() ? g_backdrop.heavySRV() : g_blackSRV,
+                         g_backdrop.ok() ? g_backdrop.softSRV() : g_blackSRV);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     g_ovrSwap->Present(0, 0);
 
@@ -725,6 +910,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     HICON appIcon = static_cast<HICON>(LoadImageW(
         GetModuleHandle(nullptr), MAKEINTRESOURCEW(IDI_APEX), IMAGE_ICON, 0, 0,
         LR_DEFAULTSIZE | LR_SHARED));
+    g_trayIcon       = appIcon;
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW wc = {sizeof(wc),     CS_CLASSDC,        WndProc,         0L, 0L,
                       GetModuleHandle(nullptr), appIcon,  nullptr,        nullptr,
@@ -775,7 +962,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         g_backdrop.SetProtectedWindow(g_ovrHwnd);
     }
 
-    const bool backdropOk = g_backdrop.Init(g_device, g_context, hwnd);
+    const bool backdropNeededAtStart =
+        apex::g_guiTransparency ||
+        (apex::g_playerOverlay &&
+         apex::settings::GetBool("spotify_category", false));
+    const bool backdropOk =
+        g_backdrop.Init(g_device, g_context, hwnd, backdropNeededAtStart);
     g_backdrop.SetUIBlurSpread(3.0f);
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -863,8 +1055,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     Glass::g = &g_renderer;
     g_mainCtx = ImGui::GetCurrentContext();
 
-    (void)backdropOk;
-
     Glass::SetGlobalMaterial(0.70f, 0.25f, 1.35f, 12.0f, 0.9f, 0.22f, 0.10f);
 
     Glass::SetLiquidFlow(0.0f);
@@ -897,7 +1087,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     apex::ReapplyHotkeys();
 
     apex::crosshair::Create();
-    apex::overlay::Create();
+    if (apex::settings::GetBool("overlay_on", false))
+        apex::overlay::Create();
     g_backdrop.AddFreezeWindow(apex::crosshair::Window());
     g_backdrop.AddFreezeWindow(apex::overlay::Window());
 
@@ -906,6 +1097,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     LARGE_INTEGER lastBlur{};
 
     const ULONGLONG startTick = GetTickCount64();
+    bool backdropWasWanted = backdropNeededAtStart;
+
+    g_pacer.Init();
 
     bool done = false;
     while (!done) {
@@ -922,7 +1116,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         apex::crosshair::Tick();
         apex::overlay::Tick();
 
+        // The image overlay window is created on demand; register it with the
+        // backdrop freezer as soon as it exists.
+        static HWND trackedOverlayHwnd = nullptr;
+        if (apex::overlay::Window() != trackedOverlayHwnd) {
+            trackedOverlayHwnd = apex::overlay::Window();
+            g_backdrop.AddFreezeWindow(trackedOverlayHwnd);
+        }
+
         const bool ovrAllowed = (GetTickCount64() - startTick) > 3000;
+
+        // Parked in the notification area: skip the main swap chain entirely.
+        // Only the optional Spotify player keeps rendering, at half rate.
+        if (g_trayHidden) {
+            if (apex::g_playerOverlay && ovrAllowed)
+                RenderOverlayFrame(app, true);
+            g_pacer.Wait(apex::g_playerOverlay ? 30.0 : 8.0);
+            if (app.CloseRequested())
+                done = true;
+            continue;
+        }
+
         if (g_occluded && g_swapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
             RenderOverlayFrame(app, ovrAllowed);
             Sleep(10);
@@ -945,11 +1159,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                               : 1.0;
         const bool doBlur = sinceBlur >= (1.0 / 15.0);
 
-        if (doBlur) {
+        // Desktop capture + blur is expensive and only observable when the
+        // translucent GUI or the Spotify player overlay is on screen.  The
+        // main window may briefly hide itself while the backdrop refreshes,
+        // so do not gate on its visibility here; minimised windows are skipped
+        // by the occlusion path above.
+        const bool backdropWanted =
+            apex::g_playerOverlay || apex::g_guiTransparency;
+        const bool backdropJustEnabled = backdropWanted && !backdropWasWanted;
+        backdropWasWanted = backdropWanted;
+
+        if (doBlur || backdropJustEnabled) {
             lastBlur = now;
-            if (backdropOk)
+            if (backdropWanted)
                 g_backdrop.Capture();
         }
+
+        const bool mainVisible = IsWindowVisible(hwnd) != FALSE && !IsIconic(hwnd);
 
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -985,6 +1211,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             Glass::PlaySfx(Glass::Sfx::Tap);
         Glass::SfxResetConsumed();
 
+        const bool uiBlurUsed = Glass::ConsumeUIBlurRequest();
+
         ImGui::Render();
 
         RenderOverlayFrame(app, ovrAllowed);
@@ -998,12 +1226,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         vp.Height   = static_cast<float>(ch);
         vp.MaxDepth = 1.0f;
         g_context->RSSetViewports(1, &vp);
-        const bool useBlack = !apex::g_guiTransparency && g_blackSRV != nullptr;
+        const bool useBlack =
+            (!apex::g_guiTransparency || !g_backdrop.ok()) &&
+            g_blackSRV != nullptr;
         g_renderer.Render(useBlack ? g_blackSRV : g_backdrop.heavySRV(),
                           useBlack ? g_blackSRV : g_backdrop.softSRV());
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        if (doBlur && backdropOk) {
+        if (doBlur && backdropOk && uiBlurUsed && mainVisible) {
             ID3D11Texture2D* backBuffer = nullptr;
             if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) &&
                 backBuffer != nullptr) {
@@ -1020,9 +1250,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         const HRESULT hr = g_swapChain->Present(1, 0);
         g_occluded = (hr == DXGI_STATUS_OCCLUDED);
 
+        // Cap the loop at 60 FPS while the window is in use and 30 FPS when it
+        // is in the background with the pointer elsewhere.  Frames are still
+        // presented with vsync so the visible output is unchanged.
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool foreground = GetForegroundWindow() == hwnd;
+        bool cursorOverApp = false;
+        if (!foreground) {
+            POINT pt{};
+            if (GetCursorPos(&pt)) {
+                const HWND hit = GetAncestor(WindowFromPoint(pt), GA_ROOT);
+                cursorOverApp = hit == hwnd || hit == g_ovrHwnd ||
+                                hit == apex::overlay::Window() ||
+                                hit == apex::crosshair::Window();
+            }
+        }
+        const bool booting = (nowTick - startTick) < 2600;
+        const double targetFps =
+            (foreground || cursorOverApp || apex::g_playerOverlay || booting)
+                ? 60.0
+                : 30.0;
+        g_pacer.Wait(targetFps);
+
         if (app.CloseRequested())
             done = true;
     }
+
+    g_pacer.Shutdown();
+    RemoveTrayIcon();
 
     apex::spotify::Stop();
     apex::UnregisterHotkeys();

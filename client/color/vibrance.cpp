@@ -2,6 +2,7 @@
 
 #include "adl_backend.h"
 #include "gamma.h"
+#include "nvidia_backend.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -39,6 +41,80 @@ std::string BaseName(const std::string& path) {
     const auto slash = path.find_last_of("\\/");
     const std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
     return ToLower(name);
+}
+
+std::string Narrow(const wchar_t* text) {
+    if (text == nullptr || *text == L'\0') return std::string();
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0,
+                                           nullptr, nullptr);
+    if (needed <= 1) return std::string();
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+struct NativeMonitor {
+    std::string device;
+    std::string name;
+    int         width   = 0;
+    int         height  = 0;
+    int         left    = 0;
+    int         top     = 0;
+    bool        primary = false;
+};
+
+BOOL CALLBACK CollectMonitorProc(HMONITOR monitor, HDC, LPRECT, LPARAM param) {
+    auto* list = reinterpret_cast<std::vector<NativeMonitor>*>(param);
+    if (list == nullptr) return TRUE;
+
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info))
+        return TRUE;
+
+    NativeMonitor entry;
+    entry.device  = Narrow(info.szDevice);
+    entry.width   = info.rcMonitor.right - info.rcMonitor.left;
+    entry.height  = info.rcMonitor.bottom - info.rcMonitor.top;
+    entry.left    = info.rcMonitor.left;
+    entry.top     = info.rcMonitor.top;
+    entry.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+    DISPLAY_DEVICEW display = {};
+    display.cb = sizeof(display);
+    if (EnumDisplayDevicesW(info.szDevice, 0, &display, 0))
+        entry.name = Narrow(display.DeviceString);
+
+    list->push_back(entry);
+    return TRUE;
+}
+
+std::vector<MonitorInfo> EnumerateMonitors() {
+    std::vector<NativeMonitor> native;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorProc,
+                        reinterpret_cast<LPARAM>(&native));
+
+    std::stable_sort(native.begin(), native.end(),
+                     [](const NativeMonitor& a, const NativeMonitor& b) {
+                         if (a.primary != b.primary) return a.primary;
+                         if (a.left != b.left) return a.left < b.left;
+                         return a.top < b.top;
+                     });
+
+    std::vector<MonitorInfo> out;
+    out.reserve(native.size());
+    for (size_t i = 0; i < native.size(); ++i) {
+        MonitorInfo info;
+        info.index   = static_cast<int>(i);
+        info.label   = "screen " + std::to_string(i + 1);
+        info.name    = native[i].name;
+        info.device  = native[i].device;
+        info.width   = native[i].width;
+        info.height  = native[i].height;
+        info.primary = native[i].primary;
+        out.push_back(info);
+    }
+    return out;
 }
 
 std::string Trim(const std::string& text) {
@@ -104,13 +180,17 @@ bool VibranceEngine::Start() {
     Load();
 
     AdlBackend::Get().Init();
+    NvidiaBackend::Get().Init();
     GammaBackend::Get().Init();
 
     {
         std::lock_guard lock(mutex_);
+        RefreshMonitorsLocked();
         satCacheValid_  = false;
         hueCacheValid_  = false;
         tempCacheValid_ = false;
+        selectionChanged_ = false;
+        disabledRestored_ = false;
     }
 
     ApplyNow(true);
@@ -118,7 +198,7 @@ bool VibranceEngine::Start() {
     running_ = true;
     watcher_ = std::thread(&VibranceEngine::WatchLoop, this);
 
-    return AdlReady() || GammaReady();
+    return AdlReady() || NvidiaReady() || GammaReady();
 }
 
 void VibranceEngine::Stop() {
@@ -131,6 +211,7 @@ void VibranceEngine::Stop() {
     AdlBackend::Get().RestoreSaturation();
     AdlBackend::Get().RestoreColorOnAll(kColorHue);
     AdlBackend::Get().RestoreColorOnAll(kColorTemperature);
+    NvidiaBackend::Get().RestoreSaturation();
     GammaBackend::Get().Reset();
 
     {
@@ -138,15 +219,22 @@ void VibranceEngine::Stop() {
         satCacheValid_  = false;
         hueCacheValid_  = false;
         tempCacheValid_ = false;
+        selectionChanged_ = false;
+        disabledRestored_ = false;
         dirty_          = false;
     }
 
     AdlBackend::Get().Shutdown();
+    NvidiaBackend::Get().Shutdown();
     GammaBackend::Get().Shutdown();
 }
 
 bool VibranceEngine::AdlReady() const {
     return AdlBackend::Get().Ready();
+}
+
+bool VibranceEngine::NvidiaReady() const {
+    return NvidiaBackend::Get().Ready();
 }
 
 bool VibranceEngine::GammaReady() const {
@@ -159,11 +247,25 @@ bool VibranceEngine::Running() const {
 
 std::string VibranceEngine::BackendInfo() const {
     std::string info;
-    if (AdlReady())
+    bool gpuBackend = false;
+
+    if (AdlReady()) {
         info += AdlBackend::Get().BackendName() + " (" +
                 std::to_string(AdlBackend::Get().Displays().size()) + " display(s))";
-    else
+        gpuBackend = true;
+    }
+
+    if (NvidiaReady()) {
+        if (gpuBackend) info += "  |  ";
+        info += NvidiaBackend::Get().BackendName() + " (" +
+                std::to_string(NvidiaBackend::Get().DisplayCount()) + " display(s))";
+        gpuBackend = true;
+    }
+
+    if (!gpuBackend) {
         info += "AMD ADL: " + AdlBackend::Get().Error();
+        info += "  |  NVIDIA: " + NvidiaBackend::Get().Error();
+    }
 
     if (GammaReady())
         info += "  |  gamma ramp (" + std::to_string(GammaBackend::Get().DisplayCount()) +
@@ -268,6 +370,151 @@ bool VibranceEngine::TemperatureAvailable() const {
     return AdlBackend::Get().TemperatureAvailable();
 }
 
+std::vector<MonitorInfo> VibranceEngine::Monitors() const {
+    std::lock_guard lock(mutex_);
+    return monitors_;
+}
+
+int VibranceEngine::SelectedMonitor() const {
+    std::lock_guard lock(mutex_);
+    return selectedMonitor_;
+}
+
+void VibranceEngine::SetSelectedMonitor(int index) {
+    std::lock_guard lock(mutex_);
+    if (index >= static_cast<int>(monitors_.size()))
+        index = -1;
+    if (index < -1) index = -1;
+    if (selectedMonitor_ == index) return;
+
+    selectedMonitor_  = index;
+    selectionChanged_ = true;
+    satCacheValid_    = false;
+    hueCacheValid_    = false;
+    tempCacheValid_   = false;
+    pendingForce_     = true;
+    pending_          = true;
+    MarkDirtyLocked();
+}
+
+void VibranceEngine::ResetToUnity() {
+    std::lock_guard lock(mutex_);
+    desktopSat_  = kSaturationDefault;
+    hue_         = kSaturationDefault;
+    temperature_ = kSaturationDefault;
+    brightness_  = 1.0f;
+    contrast_    = 1.0f;
+    gamma_       = 1.0f;
+    pendingForce_ = true;
+    pending_      = true;
+    MarkDirtyLocked();
+}
+
+void VibranceEngine::RefreshMonitorsLocked() {
+    std::vector<MonitorInfo> found = EnumerateMonitors();
+
+    if (found.empty()) {
+        // Headless/fallback case: derive a screen count from the backends.
+        const size_t count = std::max({
+            AdlBackend::Get().Displays().size(),
+            static_cast<size_t>(NvidiaBackend::Get().DisplayCount()),
+            static_cast<size_t>(GammaBackend::Get().DisplayCount())});
+        for (size_t i = 0; i < count; ++i) {
+            MonitorInfo info;
+            info.index  = static_cast<int>(i);
+            info.label  = "screen " + std::to_string(i + 1);
+            info.device = GammaBackend::Get().DeviceName(static_cast<int>(i));
+            found.push_back(info);
+        }
+    }
+
+    monitors_ = std::move(found);
+    if (selectedMonitor_ >= static_cast<int>(monitors_.size()))
+        selectedMonitor_ = -1;
+    if (selectedMonitor_ < -1)
+        selectedMonitor_ = -1;
+}
+
+void VibranceEngine::RestoreAllTargetsLocked() {
+    AdlBackend::Get().RestoreSaturation();
+    AdlBackend::Get().RestoreColorOnAll(kColorHue);
+    AdlBackend::Get().RestoreColorOnAll(kColorTemperature);
+    NvidiaBackend::Get().RestoreSaturation();
+    GammaBackend::Get().Reset();
+
+    satCacheValid_  = false;
+    hueCacheValid_  = false;
+    tempCacheValid_ = false;
+}
+
+std::string VibranceEngine::GammaDeviceForLocked(int monitor) const {
+    if (monitor < 0 || monitor >= static_cast<int>(monitors_.size())) {
+        // -1 (all screens) is handled by the caller with an empty device.
+        return std::string();
+    }
+    const std::string& device = monitors_[monitor].device;
+    if (!device.empty())
+        return device;
+    return GammaBackend::Get().DeviceName(monitor);
+}
+
+int VibranceEngine::AdlDisplayForLocked(int monitor) const {
+    if (monitor < 0) return -1;
+
+    const std::vector<DisplayTarget> displays = AdlBackend::Get().Displays();
+    if (monitor >= static_cast<int>(displays.size()) ||
+        monitor >= static_cast<int>(monitors_.size()))
+        return monitor;
+
+    const std::string& device = monitors_[monitor].device;
+    if (device.empty())
+        return monitor;
+
+    // ADL reports the Windows device path (for example \\.\DISPLAY2) for each
+    // output. Matching on it keeps "screen N" stable even when the driver
+    // enumerates outputs in a different order than Windows sorts monitors.
+    for (size_t i = 0; i < displays.size(); ++i) {
+        if (_stricmp(displays[i].name.c_str(), device.c_str()) == 0)
+            return static_cast<int>(i);
+    }
+    return monitor;
+}
+
+void VibranceEngine::RefreshMonitorsIfChanged() {
+    std::vector<MonitorInfo> found = EnumerateMonitors();
+    if (found.empty())
+        return;  // keep the last known list if enumeration fails transiently
+
+    std::lock_guard lock(mutex_);
+
+    bool changed = found.size() != monitors_.size();
+    if (!changed) {
+        for (size_t i = 0; i < found.size(); ++i) {
+            const MonitorInfo& a = found[i];
+            const MonitorInfo& b = monitors_[i];
+            if (a.device != b.device || a.width != b.width ||
+                a.height != b.height || a.primary != b.primary) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (!changed) return;
+
+    monitors_ = std::move(found);
+
+    // Display numbering may have shifted: fall back to all screens so the
+    // current values are never left applied to a screen the user did not pick.
+    selectedMonitor_  = -1;
+    selectionChanged_ = false;
+    satCacheValid_    = false;
+    hueCacheValid_    = false;
+    tempCacheValid_   = false;
+    pendingForce_     = true;
+    pending_          = true;
+    MarkDirtyLocked();
+}
+
 std::vector<AppRule> VibranceEngine::Rules() const {
     std::lock_guard lock(mutex_);
     return rules_;
@@ -318,6 +565,11 @@ std::string VibranceEngine::StatusLine() const {
         if (rule != nullptr)
             text += "  (profile: " + rule->exe + ")";
     }
+    if (selectedMonitor_ >= 0 &&
+        selectedMonitor_ < static_cast<int>(monitors_.size()))
+        text += "  |  " + monitors_[selectedMonitor_].label;
+    else
+        text += "  |  all screens";
     text += "  |  front: " + (foreground_.empty() ? std::string("-") : foreground_);
     return text;
 }
@@ -341,25 +593,43 @@ int VibranceEngine::TargetSaturationLocked() const {
 }
 
 void VibranceEngine::ApplySaturation(int value, bool force) {
-    auto& adl = AdlBackend::Get();
-    if (!adl.Ready()) return;
+    auto& adl    = AdlBackend::Get();
+    auto& nvidia = NvidiaBackend::Get();
 
-    const auto displays = adl.Displays();
-    if (displays.empty()) return;
+    const bool adlReady    = adl.Ready();
+    const bool nvidiaReady = nvidia.Ready();
+    if (!adlReady && !nvidiaReady) return;
 
     if (!force && satCacheValid_ && value == satCache_) return;
 
+    const int adlTarget = AdlDisplayForLocked(selectedMonitor_);
     bool needsWrite = false;
-    for (const auto& target : displays) {
-        ColorValue current;
-        if (!adl.GetColor(target, kColorSaturation, current) ||
-            current.current != AdlBackend::MapSaturation(target, value)) {
-            needsWrite = true;
-            break;
+
+    if (adlReady) {
+        const auto displays = adl.Displays();
+        if (adlTarget < static_cast<int>(displays.size())) {
+            for (size_t i = 0; i < displays.size(); ++i) {
+                if (adlTarget >= 0 &&
+                    static_cast<int>(i) != adlTarget)
+                    continue;
+                const auto& target = displays[i];
+                ColorValue current;
+                if (!adl.GetColor(target, kColorSaturation, current) ||
+                    current.current != AdlBackend::MapSaturation(target, value)) {
+                    needsWrite = true;
+                    break;
+                }
+            }
         }
     }
-    if (needsWrite)
-        adl.SetSaturationOnAll(value);
+
+    if (!needsWrite && nvidiaReady)
+        needsWrite = !nvidia.MatchesSaturation(value, selectedMonitor_);
+
+    if (needsWrite) {
+        if (adlReady)    adl.SetSaturation(value, adlTarget);
+        if (nvidiaReady) nvidia.SetSaturationOnAll(value, selectedMonitor_);
+    }
 
     satCache_      = value;
     satCacheValid_ = true;
@@ -374,12 +644,28 @@ void VibranceEngine::ApplyExtraColor(int flag, int value, bool force) {
 
     if (!force && *valid && value == *cache) return;
 
-    adl.SetColorOnAll(flag, value);
+    adl.SetColorOnTargets(flag, value, AdlDisplayForLocked(selectedMonitor_));
     *cache = value;
     *valid = true;
 }
 
 void VibranceEngine::ApplyLocked(bool force) {
+    if (!enabled_) {
+        if (!disabledRestored_) {
+            RestoreAllTargetsLocked();
+            disabledRestored_ = true;
+        }
+        appliedSat_ = kSaturationDefault;
+        return;
+    }
+    disabledRestored_ = false;
+
+    if (selectionChanged_) {
+        selectionChanged_ = false;
+        RestoreAllTargetsLocked();
+        force = true;
+    }
+
     const int target = TargetSaturationLocked();
     ApplySaturation(target, force);
     appliedSat_ = target;
@@ -402,20 +688,24 @@ void VibranceEngine::ApplyLocked(bool force) {
     auto& gamma = GammaBackend::Get();
     if (gamma.Ready()) {
         float b = 1.0f, c = 1.0f, g = 1.0f;
-        if (enabled_) {
-            const AppRule* rule = RuleInFrontLocked();
-            if (rule != nullptr && rule->levels) {
-                b = rule->brightness;
-                c = rule->contrast;
-                g = rule->gamma;
-            } else {
-                b = brightness_;
-                c = contrast_;
-                g = gamma_;
-            }
+        const AppRule* rule = RuleInFrontLocked();
+        if (rule != nullptr && rule->levels) {
+            b = rule->brightness;
+            c = rule->contrast;
+            g = rule->gamma;
+        } else {
+            b = brightness_;
+            c = contrast_;
+            g = gamma_;
         }
-        if (!gamma.Matches(b, c, g))
-            gamma.Apply(b, c, g);
+
+        const std::string device =
+            (selectedMonitor_ >= 0) ? GammaDeviceForLocked(selectedMonitor_)
+                                    : std::string();
+        if (selectedMonitor_ < 0 || !device.empty()) {
+            if (!gamma.Matches(b, c, g, device))
+                gamma.Apply(b, c, g, device);
+        }
     }
 }
 
@@ -446,6 +736,13 @@ void VibranceEngine::WatchLoop() {
         const bool need  = pending_.exchange(false) || changed || force;
 
         const uint64_t now = GetTickCount64();
+
+        // Hot-plug / resolution changes: keep the screen cards in sync. The
+        // scan is cheap and only runs twice a second.
+        if (now - lastMonitorScan_ >= 2000) {
+            lastMonitorScan_ = now;
+            RefreshMonitorsIfChanged();
+        }
 
         if (need || now - lastFullApply >= 1500) {
             lastFullApply = now;
@@ -550,6 +847,7 @@ bool VibranceEngine::Load() {
         else if (key == "brightness")   brightness_ = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 1.50f);
         else if (key == "contrast")     contrast_   = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 1.50f);
         else if (key == "gamma")        gamma_      = ClampFloat(static_cast<float>(atof(value.c_str())), 0.50f, 2.00f);
+        else if (key == "monitor")      selectedMonitor_ = std::max(-1, atoi(value.c_str()));
     }
 
     std::lock_guard lock(mutex_);
@@ -578,6 +876,8 @@ bool VibranceEngine::Save() const {
     out << "gamma=" << gamma_ << "\n";
     out << "hue=" << hue_ << "\n";
     out << "temperature=" << temperature_ << "\n";
+    out << "; -1 = all screens, 0 = screen 1, 1 = screen 2 ...\n";
+    out << "monitor=" << selectedMonitor_ << "\n";
     out << "\n; one profile per application\n";
     out << ";   exe=saturation,hue,temperature\n";
     out << ";   exe=saturation,hue,temperature,brightness,contrast,gamma   (with levels)\n";
