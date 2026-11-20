@@ -287,10 +287,10 @@ void ApplySlot(int slot) {
 void ReapplyHotkeys() {
     if (g_hkHwnd == nullptr)
         g_hkHwnd = App::Get().Window();
-    for (int s = 0; s < 5; ++s) {
-        g_hkVk[s] = settings::GetInt(kHkKey[s], 0);
-        ApplySlot(s);
-    }
+    // The Spotify player and image overlay were removed; only the crosshair
+    // hotkey is still registered.
+    g_hkVk[3] = settings::GetInt(kHkKey[3], 0);
+    ApplySlot(3);
 }
 
 void UnregisterHotkeys() {
@@ -542,18 +542,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_HOTKEY: {
 
             const int slot = static_cast<int>(wParam) - 0x5001;
-            if (slot >= 0 && slot < 3) {
-                apex::spotify::Post(slot == 0 ? apex::spotify::Cmd::PlayPause
-                                    : slot == 1 ? apex::spotify::Cmd::Prev
-                                                : apex::spotify::Cmd::Next);
-                return 0;
-            }
             if (slot == 3) {
                 apex::crosshair::Toggle();
-                return 0;
-            }
-            if (slot == 4) {
-                apex::overlay::Toggle();
                 return 0;
             }
             break;
@@ -939,29 +929,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
-    {
-        RECT workArea{};
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-        const int ovrX = apex::settings::GetInt(
-            "player_x", static_cast<int>(work.right - kOvrW * scale - 40));
-        const int ovrY = apex::settings::GetInt(
-            "player_y", static_cast<int>(work.bottom - kOvrH * scale - 40));
-
-        const int defW = static_cast<int>(kOvrW * scale);
-        const int defH = static_cast<int>(kOvrH * scale);
-        int ovrW = apex::settings::GetInt("player_w", defW);
-        int ovrH = apex::settings::GetInt("player_h", defH);
-        const int maxW = (workArea.right - workArea.left) - 40;
-        const int maxH = (workArea.bottom - workArea.top) - 40;
-        if (ovrW < 320) ovrW = defW;
-        if (ovrH < 160) ovrH = defH;
-        if (ovrW > maxW) ovrW = maxW;
-        if (ovrH > maxH) ovrH = maxH;
-        CreateOverlayWindow(GetModuleHandle(nullptr), scale, ovrX, ovrY,
-                            ovrW, ovrH);
-        g_backdrop.SetProtectedWindow(g_ovrHwnd);
-    }
-
     const bool backdropNeededAtStart =
         apex::g_guiTransparency ||
         (apex::g_playerOverlay &&
@@ -1064,8 +1031,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     InitOverlayImGui(scale);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    apex::spotify::Start();
 
     {
         const std::string logoFile = AssetPath("logo.jpg");
@@ -1279,7 +1244,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     g_pacer.Shutdown();
     RemoveTrayIcon();
 
-    apex::spotify::Stop();
     apex::UnregisterHotkeys();
     apex::overlay::Destroy();
     apex::crosshair::Destroy();

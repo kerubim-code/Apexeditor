@@ -1605,17 +1605,14 @@ void ImportApexFolder(HWND owner) {
 
 void ApplyImportedSettings() {
     g_guiTransparency = settings::GetBool("gui_transparency", false);
-    g_showOverlayCategory = settings::GetBool("overlay_category", false);
-    g_showSpotifyCategory = settings::GetBool("spotify_category", false);
-    if (!g_showOverlayCategory)
-        settings::SetBool("overlay_on", false);
-    if (!g_showSpotifyCategory) {
-        settings::SetBool("spotify_overlay", false);
-    }
-    g_playerOverlay   = settings::GetBool("spotify_overlay", false);
-    g_playerOpacity   = static_cast<float>(std::max(
-        25, std::min(100, settings::GetInt("spotify_overlay_opacity", 85))));
-    g_playerLyrics    = settings::GetBool("spotify_lyrics", true);
+    // The Spotify player and image overlay categories were removed.
+    g_showOverlayCategory = false;
+    g_showSpotifyCategory = false;
+    g_playerOverlay       = false;
+    settings::SetBool("overlay_category", false);
+    settings::SetBool("spotify_category", false);
+    settings::SetBool("overlay_on", false);
+    settings::SetBool("spotify_overlay", false);
     ReapplyHotkeys();
 
     crosshair::SetEnabled(settings::GetBool("crosshair_on", false));
@@ -1632,7 +1629,7 @@ void ApplyImportedSettings() {
         rgb[2] = static_cast<float>(packed & 0xFF) / 255.0f;
     }
 
-    overlay::Show(settings::GetBool("overlay_on", false));
+    overlay::Show(false);
     overlay::SetClickThrough(settings::GetBool("overlay_click", false));
     overlay::SetLocked(settings::GetBool("overlay_lock", false));
     overlay::SetResolutionIndex(settings::GetInt("overlay_res", 0));
@@ -3262,45 +3259,6 @@ void App::DrawMisc() {
         Toast(Glass::Icon::CheckCircle, kOk,
               transparency ? "gui transparency on" : "clean black background",
               transparency ? "desktop blur" : "black glass");
-    }
-
-    Glass::EndPanel();
-
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    Glass::BeginPanel("categories");
-
-    bool overlayCategory = g_showOverlayCategory;
-    if (Glass::Toggle("overlay category", &overlayCategory)) {
-        g_showOverlayCategory = overlayCategory;
-        settings::SetBool("overlay_category", overlayCategory);
-        if (!overlayCategory) {
-            overlay::Show(false);
-            if (section == Section::Overlay) {
-                section = Section::Misc;
-                if (settings::GetBool("remember_section", true))
-                    settings::SetInt("section", static_cast<int>(section));
-            }
-        }
-        Toast(Glass::Icon::CheckCircle, kOk, "overlay",
-              overlayCategory ? "category shown" : "category hidden");
-    }
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-
-    bool spotifyCategory = g_showSpotifyCategory;
-    if (Glass::Toggle("spotify category", &spotifyCategory)) {
-        g_showSpotifyCategory = spotifyCategory;
-        settings::SetBool("spotify_category", spotifyCategory);
-        if (!spotifyCategory) {
-            g_playerOverlay = false;
-            settings::SetBool("spotify_overlay", false);
-            if (section == Section::Spotify) {
-                section = Section::Misc;
-                if (settings::GetBool("remember_section", true))
-                    settings::SetInt("section", static_cast<int>(section));
-            }
-        }
-        Toast(Glass::Icon::CheckCircle, kOk, "spotify",
-              spotifyCategory ? "category shown" : "category hidden");
     }
 
     Glass::EndPanel();

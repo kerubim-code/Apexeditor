@@ -19,7 +19,7 @@
 
 namespace apex {
 
-bool  g_playerOverlay  = settings::GetBool("spotify_overlay", false);
+bool  g_playerOverlay  = false;
 float g_playerOpacity  = static_cast<float>(
     std::max(25, std::min(100, settings::GetInt("spotify_overlay_opacity", 85))));
 bool  g_playerLyrics   = settings::GetBool("spotify_lyrics", true);
@@ -177,14 +177,14 @@ App& App::Get() {
 void App::Init(HWND hwnd) {
     hwnd_ = hwnd;
 
-    g_showOverlayCategory = settings::GetBool("overlay_category", false);
-    g_showSpotifyCategory = settings::GetBool("spotify_category", false);
-    if (!g_showOverlayCategory)
-        settings::SetBool("overlay_on", false);
-    if (!g_showSpotifyCategory) {
-        g_playerOverlay = false;
-        settings::SetBool("spotify_overlay", false);
-    }
+    // The Spotify player and image overlay categories were removed.
+    g_showOverlayCategory = false;
+    g_showSpotifyCategory = false;
+    g_playerOverlay       = false;
+    settings::SetBool("overlay_category", false);
+    settings::SetBool("spotify_category", false);
+    settings::SetBool("overlay_on", false);
+    settings::SetBool("spotify_overlay", false);
 
     if (settings::GetBool("boot_animation", true)) {
         bootStart_ = GetTickCount64();
